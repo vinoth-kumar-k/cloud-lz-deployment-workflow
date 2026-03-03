@@ -1,0 +1,303 @@
+# -----------------------------------------------------------
+# Workflow: Landing Zone – Deploy
+#
+# Triggered on merge to main (for incremental changes) or
+# manually via workflow_dispatch (for Day-1 bootstrap).
+#
+# Runner handoff pattern:
+#   1. self-hosted-corporate  →  checkout + package source
+#   2. self-hosted-cloud      →  validate + plan
+#   3. (GitHub Environment approval gate)
+#   4. self-hosted-cloud      →  apply
+#
+# All Alibaba Cloud authentication is handled by OIDC –
+# zero static credentials stored in GitHub.
+# -----------------------------------------------------------
+name: LZ – Deploy
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "terraform/**"
+
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Terraform target (leave blank for full apply)"
+        required: false
+        default: ""
+      destroy:
+        description: "Set to 'DESTROY' to run terraform destroy (dangerous)"
+        required: false
+        default: ""
+      environment:
+        description: "Target environment"
+        required: true
+        default: "landing-zone"
+        type: choice
+        options:
+          - landing-zone
+
+permissions:
+  contents: read
+  id-token: write           # OIDC token generation
+  deployments: write        # create deployment records
+
+concurrency:
+  group: lz-deploy-${{ github.ref }}
+  cancel-in-progress: false  # never cancel an in-flight deploy
+
+env:
+  TF_VERSION: "1.9.5"
+  ALICLOUD_REGION: ${{ vars.ALICLOUD_REGION }}
+  TF_WORKING_DIR: terraform/environments/landing-zone
+  DEPLOY_ENV: ${{ inputs.environment || 'landing-zone' }}
+
+jobs:
+  # ----------------------------------------------------------
+  # Job 1: Fetch – inside the corporate network.
+  # ----------------------------------------------------------
+  fetch-source:
+    name: Fetch Source (corporate runner)
+    runs-on: [self-hosted, corporate]
+    outputs:
+      artifact-name: ${{ steps.set-artifact.outputs.name }}
+      run-destroy: ${{ steps.check-destroy.outputs.run-destroy }}
+
+    steps:
+      - name: Checkout IaC repository
+        uses: actions/checkout@v4
+
+      - name: Set artifact name
+        id: set-artifact
+        run: |
+          echo "name=lz-source-deploy-${{ github.run_id }}-${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Check destroy flag
+        id: check-destroy
+        run: |
+          if [[ "${{ inputs.destroy }}" == "DESTROY" ]]; then
+            echo "run-destroy=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::DESTROY mode activated – this will tear down the landing zone!"
+          else
+            echo "run-destroy=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package source
+        run: |
+          tar --exclude='.git' \
+              --exclude='**/.terraform' \
+              --exclude='**/*.tfstate*' \
+              -czf /tmp/lz-source.tar.gz .
+
+      - name: Upload source artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.set-artifact.outputs.name }}
+          path: /tmp/lz-source.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+
+  # ----------------------------------------------------------
+  # Job 2: Plan – on cloud-connected runner, OIDC auth.
+  # ----------------------------------------------------------
+  plan:
+    name: Terraform Plan
+    needs: fetch-source
+    runs-on: [self-hosted, cloud]
+    environment: lz-plan
+    outputs:
+      plan-artifact: ${{ steps.set-plan-artifact.outputs.name }}
+      has-changes: ${{ steps.detect-changes.outputs.has-changes }}
+
+    steps:
+      - name: Download source artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.fetch-source.outputs.artifact-name }}
+
+      - name: Extract source
+        run: tar -xzf lz-source.tar.gz
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure Alibaba Cloud credentials (OIDC)
+        uses: aliyun/alibaba-cloud-setup-credentials@v1
+        with:
+          role-to-assume: ${{ vars.ALICLOUD_OIDC_ROLE_ARN }}
+          oidc-provider-arn: ${{ vars.ALICLOUD_OIDC_PROVIDER_ARN }}
+          role-session-name: gh-lz-plan-${{ github.run_id }}
+          role-duration-seconds: 3600
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="prefix=landing-zone/terraform.tfstate" \
+            -backend-config="region=${{ env.ALICLOUD_REGION }}" \
+            -backend-config="tablestore_endpoint=${{ vars.TF_LOCK_TABLESTORE_ENDPOINT }}" \
+            -backend-config="tablestore_table=${{ vars.TF_LOCK_TABLE }}"
+
+      - name: Terraform Plan (apply)
+        id: tf-plan
+        if: needs.fetch-source.outputs.run-destroy == 'false'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          TF_TARGET_ARGS=""
+          if [[ -n "${{ inputs.target }}" ]]; then
+            TF_TARGET_ARGS="-target=${{ inputs.target }}"
+          fi
+
+          terraform plan \
+            -var-file=landing-zone.tfvars \
+            ${TF_TARGET_ARGS} \
+            -out=tfplan \
+            -detailed-exitcode \
+            -no-color \
+            2>&1 | tee plan-output.txt
+          echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Terraform Plan (destroy)
+        id: tf-plan-destroy
+        if: needs.fetch-source.outputs.run-destroy == 'true'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform plan \
+            -var-file=landing-zone.tfvars \
+            -destroy \
+            -out=tfplan \
+            -no-color \
+            2>&1 | tee plan-output.txt
+
+      - name: Detect changes
+        id: detect-changes
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          if grep -q "No changes." plan-output.txt; then
+            echo "has-changes=false" >> "$GITHUB_OUTPUT"
+            echo "No infrastructure changes detected."
+          else
+            echo "has-changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set plan artifact name
+        id: set-plan-artifact
+        run: |
+          echo "name=tfplan-${{ github.run_id }}-${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.set-plan-artifact.outputs.name }}
+          path: |
+            ${{ env.TF_WORKING_DIR }}/tfplan
+            ${{ env.TF_WORKING_DIR }}/plan-output.txt
+          retention-days: 5
+          if-no-files-found: error
+
+      - name: Print plan summary
+        run: |
+          echo "### Terraform Plan Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -30 ${{ env.TF_WORKING_DIR }}/plan-output.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  # ----------------------------------------------------------
+  # Job 3: Approval gate – enforced via GitHub Environments.
+  # Configure "lz-deploy" environment in repo settings with
+  # required reviewers and deployment branch protection.
+  # ----------------------------------------------------------
+  await-approval:
+    name: Await Deployment Approval
+    needs: [fetch-source, plan]
+    if: needs.plan.outputs.has-changes == 'true'
+    runs-on: [self-hosted, cloud]
+    environment: lz-deploy       # <-- required reviewers configured here
+
+    steps:
+      - name: Approval acknowledged
+        run: |
+          echo "Deployment approved for run ${{ github.run_id }}"
+          echo "Plan artifact: ${{ needs.plan.outputs.plan-artifact }}"
+
+  # ----------------------------------------------------------
+  # Job 4: Apply – on cloud-connected runner.
+  # Downloads the exact plan binary produced in Job 2.
+  # ----------------------------------------------------------
+  apply:
+    name: Terraform Apply
+    needs: [fetch-source, plan, await-approval]
+    if: needs.plan.outputs.has-changes == 'true'
+    runs-on: [self-hosted, cloud]
+
+    steps:
+      - name: Download source artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.fetch-source.outputs.artifact-name }}
+
+      - name: Extract source
+        run: tar -xzf lz-source.tar.gz
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.plan.outputs.plan-artifact }}
+          path: ${{ env.TF_WORKING_DIR }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      # Fresh OIDC token – previous session may have expired
+      - name: Configure Alibaba Cloud credentials (OIDC)
+        uses: aliyun/alibaba-cloud-setup-credentials@v1
+        with:
+          role-to-assume: ${{ vars.ALICLOUD_OIDC_ROLE_ARN }}
+          oidc-provider-arn: ${{ vars.ALICLOUD_OIDC_PROVIDER_ARN }}
+          role-session-name: gh-lz-apply-${{ github.run_id }}
+          role-duration-seconds: 7200
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="prefix=landing-zone/terraform.tfstate" \
+            -backend-config="region=${{ env.ALICLOUD_REGION }}" \
+            -backend-config="tablestore_endpoint=${{ vars.TF_LOCK_TABLESTORE_ENDPOINT }}" \
+            -backend-config="tablestore_table=${{ vars.TF_LOCK_TABLE }}"
+
+      - name: Terraform Apply
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform apply -no-color -auto-approve tfplan \
+            2>&1 | tee apply-output.txt
+
+      - name: Print apply summary
+        if: always()
+        run: |
+          echo "### Terraform Apply Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Run:** ${{ github.run_id }}  " >> "$GITHUB_STEP_SUMMARY"
+          echo "**Actor:** ${{ github.actor }}  " >> "$GITHUB_STEP_SUMMARY"
+          echo "**Commit:** ${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -50 ${{ env.TF_WORKING_DIR }}/apply-output.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload apply log
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: apply-log-${{ github.run_id }}
+          path: ${{ env.TF_WORKING_DIR }}/apply-output.txt
+          retention-days: 30
