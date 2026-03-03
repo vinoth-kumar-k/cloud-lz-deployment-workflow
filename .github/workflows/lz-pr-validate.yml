@@ -1,121 +1,76 @@
-# -----------------------------------------------------------
-# Workflow: Landing Zone – PR Validation
-#
-# Runs on every pull request targeting main.
-# Pattern:
-#   Job 1 (self-hosted-corporate) – checkout code from the
-#     corporate-network-accessible repo and upload artifact.
-#   Job 2 (self-hosted-cloud) – download artifact, run
-#     Terraform fmt/validate, security scans, and plan.
-#
-# Alibaba Cloud credentials are obtained via GitHub OIDC –
-# no static keys are stored anywhere.
-# -----------------------------------------------------------
 name: LZ – PR Validate
 
 on:
   pull_request:
-    branches:
-      - main
+    branches: [main]
     paths:
       - "terraform/**"
-      - ".github/workflows/lz-*.yml"
+      - ".github/**"
 
 permissions:
-  contents: read          # checkout
-  id-token: write         # OIDC token for Alibaba Cloud STS
-  pull-requests: write    # post plan summary as PR comment
+  contents: read
+  id-token: write
+  pull-requests: write
+  security-events: write
 
 concurrency:
   group: lz-pr-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 env:
-  TF_VERSION: "1.9.5"
-  ALICLOUD_REGION: ${{ vars.ALICLOUD_REGION }}
   TF_WORKING_DIR: terraform/environments/landing-zone
 
 jobs:
-  # ----------------------------------------------------------
-  # Job 1: Fetch source code inside the corporate network.
-  # The self-hosted runner here has access to your internal
-  # package registries / artifact stores if needed.
-  # ----------------------------------------------------------
+  # ── Corporate runner: checkout and package source ──────────
   fetch-source:
-    name: Fetch Source (corporate runner)
     runs-on: [self-hosted, corporate]
     outputs:
-      artifact-name: ${{ steps.set-artifact.outputs.name }}
-
+      artifact-name: ${{ steps.pkg.outputs.artifact-name }}
     steps:
-      - name: Checkout IaC repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          fetch-depth: 0        # needed for git diff in scan jobs
+          fetch-depth: 0
 
-      - name: Set artifact name
-        id: set-artifact
+      - id: pkg
+        shell: bash
         run: |
-          echo "name=lz-source-pr${{ github.event.pull_request.number }}-${{ github.sha }}" >> "$GITHUB_OUTPUT"
-
-      # Bundle the workspace – excludes .git and any secrets
-      - name: Package source
-        run: |
-          tar --exclude='.git' \
-              --exclude='**/.terraform' \
-              --exclude='**/*.tfstate*' \
+          echo "artifact-name=lz-source-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+          tar --exclude='.git' --exclude='**/.terraform' --exclude='**/*.tfstate*' \
               -czf /tmp/lz-source.tar.gz .
 
-      - name: Upload source artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.set-artifact.outputs.name }}
+          name: ${{ steps.pkg.outputs.artifact-name }}
           path: /tmp/lz-source.tar.gz
           retention-days: 1
           if-no-files-found: error
 
-  # ----------------------------------------------------------
-  # Job 2: Static analysis – runs on a runner that can reach
-  # public internet for tool downloads but does NOT need
-  # access to Alibaba Cloud.
-  # ----------------------------------------------------------
+  # ── Cloud runner: static analysis (no cloud creds needed) ──
   static-analysis:
-    name: Static Analysis
     needs: fetch-source
     runs-on: [self-hosted, cloud]
-
     steps:
-      - name: Download source artifact
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: ${{ needs.fetch-source.outputs.artifact-name }}
+      - run: tar -xzf lz-source.tar.gz
 
-      - name: Extract source
-        run: tar -xzf lz-source.tar.gz
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: ${{ env.TF_VERSION }}
+          terraform_version: "1.9.5"
           terraform_wrapper: false
 
-      - name: Terraform Format Check
-        id: fmt
+      - name: Format check
         run: terraform fmt -check -recursive terraform/
         continue-on-error: true
 
-      - name: Terraform Init (local backend for validation)
+      - name: Validate
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: |
           terraform init -backend=false
+          terraform validate -no-color
 
-      - name: Terraform Validate
-        id: validate
-        working-directory: ${{ env.TF_WORKING_DIR }}
-        run: terraform validate -no-color
-
-      # Security scanning – checkov covers Alibaba Cloud resources
-      - name: Run Checkov
+      - name: Checkov scan
         id: checkov
         uses: bridgecrewio/checkov-action@v12
         with:
@@ -124,79 +79,36 @@ jobs:
           output_format: cli,sarif
           output_file_path: console,checkov-results.sarif
           soft_fail: false
-          skip_check: >
-            CKV_ALI_PLACEHOLDER
         continue-on-error: true
 
-      - name: Upload Checkov SARIF
-        uses: github/codeql-action/upload-sarif@v3
+      - uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
           sarif_file: checkov-results.sarif
           category: checkov
 
-      - name: Evaluate scan results
-        if: steps.checkov.outcome == 'failure'
-        run: |
-          echo "::error::Checkov security scan found policy violations. Review the Security tab."
-          exit 1
+      - if: steps.checkov.outcome == 'failure'
+        run: exit 1
 
-  # ----------------------------------------------------------
-  # Job 3: Terraform plan – requires Alibaba Cloud access via
-  # OIDC. Runs on the cloud-connected self-hosted runner.
-  # ----------------------------------------------------------
+  # ── Cloud runner: plan against real state (OIDC auth) ──────
   plan:
-    name: Terraform Plan
     needs: [fetch-source, static-analysis]
     runs-on: [self-hosted, cloud]
-    environment: lz-plan        # gates with required reviewers if desired
-
+    environment: lz-plan
     steps:
-      - name: Download source artifact
-        uses: actions/download-artifact@v4
+      - uses: ./.github/actions/tf-init
         with:
-          name: ${{ needs.fetch-source.outputs.artifact-name }}
-
-      - name: Extract source
-        run: tar -xzf lz-source.tar.gz
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-          terraform_wrapper: false
-
-      # Exchange GitHub OIDC token for Alibaba Cloud STS credentials
-      - name: Configure Alibaba Cloud credentials (OIDC)
-        uses: aliyun/alibaba-cloud-setup-credentials@v1
-        with:
-          role-to-assume: ${{ vars.ALICLOUD_OIDC_ROLE_ARN }}
-          oidc-provider-arn: ${{ vars.ALICLOUD_OIDC_PROVIDER_ARN }}
-          role-session-name: gh-lz-plan-pr${{ github.event.pull_request.number }}
-          role-duration-seconds: 3600
-
-      - name: Terraform Init
-        working-directory: ${{ env.TF_WORKING_DIR }}
-        run: |
-          terraform init \
-            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
-            -backend-config="prefix=landing-zone/terraform.tfstate" \
-            -backend-config="region=${{ env.ALICLOUD_REGION }}" \
-            -backend-config="tablestore_endpoint=${{ vars.TF_LOCK_TABLESTORE_ENDPOINT }}" \
-            -backend-config="tablestore_table=${{ vars.TF_LOCK_TABLE }}"
+          artifact-name: ${{ needs.fetch-source.outputs.artifact-name }}
+          session-name: gh-lz-plan-pr${{ github.event.pull_request.number }}
+          working-dir: ${{ env.TF_WORKING_DIR }}
 
       - name: Terraform Plan
-        id: plan
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: |
-          terraform plan \
-            -var-file=landing-zone.tfvars \
-            -out=tfplan \
-            -no-color \
+          terraform plan -var-file=landing-zone.tfvars -out=tfplan -no-color \
             2>&1 | tee plan-output.txt
 
-      - name: Upload plan artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: tfplan-pr${{ github.event.pull_request.number }}-${{ github.sha }}
           path: |
@@ -204,34 +116,16 @@ jobs:
             ${{ env.TF_WORKING_DIR }}/plan-output.txt
           retention-days: 5
 
-      # Post plan output as a PR comment for reviewer visibility
       - name: Post plan to PR
         uses: actions/github-script@v7
         if: always()
         with:
           script: |
             const fs = require('fs');
-            const planOutput = fs.readFileSync(
-              '${{ env.TF_WORKING_DIR }}/plan-output.txt', 'utf8'
-            ).slice(0, 60000); // GitHub comment limit
-
-            const body = [
-              '## Terraform Plan – Landing Zone',
-              '',
-              `**Triggered by:** @${{ github.actor }}  `,
-              `**Commit:** \`${{ github.sha }}\``,
-              '',
-              '<details><summary>Show Plan</summary>',
-              '',
-              '```hcl',
-              planOutput,
-              '```',
-              '</details>',
-            ].join('\n');
-
+            const out = fs.readFileSync('${{ env.TF_WORKING_DIR }}/plan-output.txt', 'utf8').slice(0, 60000);
             github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body,
+              body: `## Terraform Plan\n\n<details><summary>Show plan</summary>\n\n\`\`\`hcl\n${out}\n\`\`\`\n</details>`,
             });
