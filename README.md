@@ -92,36 +92,163 @@ GitHub-hosted runners, and **GitHub OIDC** as the authentication mechanism
 
 ## 2. Runner Architecture
 
-Two runner labels are used.  Each corresponds to a runner group configured in
-GitHub Enterprise Cloud.
+### Labels and responsibilities
 
-| Label | Network | Responsibilities |
-|-------|---------|-----------------|
-| `self-hosted, corporate` | Inside corporate network | Code checkout from internal repos; package IaC source into artifact |
-| `self-hosted, cloud` | Can reach Alibaba Cloud APIs (direct or via proxy) | Terraform init / plan / apply; OIDC credential exchange with STS |
+| Label | Network zone | Responsibilities |
+|-------|-------------|-----------------|
+| `self-hosted, corporate` | Inside corporate network | Checkout from internal repos; package IaC source into artifact |
+| `self-hosted, cloud` | Corporate network + outbound internet to Alibaba Cloud APIs | Terraform init / plan / apply; OIDC token exchange with STS |
 
 ### Why two runner types?
 
-Your corporate policy prevents GitHub-hosted runners from accessing internal
-code and package registries.  The self-hosted **corporate** runner solves this
-for checkout.  The **cloud** runner only ever receives the packaged artifact
-(not raw source) and uses short-lived OIDC credentials; it never stores
-long-lived cloud credentials.
+Corporate policy prevents GitHub-hosted runners from reaching internal code
+repositories and private package registries.  The **corporate** runner handles
+the checkout; it never touches Alibaba Cloud.  The **cloud** runner receives
+only the pre-packaged artifact (never raw source) and authenticates to Alibaba
+Cloud via short-lived OIDC tokens – it stores no long-lived credentials.
 
-### Runner installation checklist
+### Pre-LZ vs post-LZ runner topology
 
-Install on each runner type the tools validated by `scripts/validate-prereqs.sh`:
+This is the key Day-1 consideration.
 
 ```
-terraform   >= 1.9
-aliyun CLI  >= 3.0
-curl, jq, git, tar
+PRE-LZ (Day-1 bootstrap)                 POST-LZ (steady state, optional)
+────────────────────────                 ───────────────────────────────
+Corporate network                        Corporate network
+  ┌────────────────┐                       ┌────────────────┐
+  │ corporate      │                       │ corporate      │
+  │ runner         │                       │ runner         │ (unchanged)
+  │ (existing VM)  │                       │ (existing VM)  │
+  └────────────────┘                       └────────────────┘
+
+  ┌────────────────┐                     Alibaba Cloud (LZ deployed)
+  │ cloud runner   │   ──── migrate ───▶   ┌──────────────────────┐
+  │ (new VM on     │                       │ cloud runner         │
+  │  corporate     │                       │ (ECS instance inside │
+  │  network with  │                       │  the LZ, egress to   │
+  │  internet/     │                       │  GitHub + STS)       │
+  │  proxy access) │                       └──────────────────────┘
+  └────────────────┘
 ```
 
-Verify a runner is correctly configured:
+**For Day-1, both runners live on corporate infrastructure.**  The cloud runner
+is simply a corporate VM that has outbound internet access (direct or via
+proxy) to the Alibaba Cloud API endpoints.  There is no chicken-and-egg
+problem – the pipeline does not depend on Alibaba Cloud compute to deploy
+Alibaba Cloud.
+
+Once the LZ is live and an ECS instance is available inside it, the cloud
+runner can optionally be migrated there.  This is purely operational preference
+and does not change any workflow or action code.
+
+### Minimum VM specification
+
+| Runner | CPU | RAM | Disk | OS |
+|--------|-----|-----|------|----|
+| corporate | 2 vCPU | 4 GB | 20 GB | Ubuntu 22.04 LTS |
+| cloud | 2 vCPU | 4 GB | 30 GB | Ubuntu 22.04 LTS |
+
+The cloud runner needs more disk because Terraform downloads provider plugins
+(~500 MB per init for the alicloud provider).
+
+### Network requirements for the cloud runner
+
+Outbound HTTPS (443) to:
+
+| Destination | Purpose |
+|-------------|---------|
+| `token.actions.githubusercontent.com` | GitHub OIDC token endpoint |
+| `api.github.com` | GitHub API (artifact upload/download) |
+| `objects.githubusercontent.com` | GitHub artifact storage |
+| `sts.aliyuncs.com` | STS OIDC token exchange |
+| `ram.aliyuncs.com` | RAM API calls |
+| `oss-cn-<region>.aliyuncs.com` | OSS state backend |
+| `<instance>.cn-<region>.ots.aliyuncs.com` | TableStore state locking |
+| `*.aliyuncs.com` | Alibaba Cloud service APIs (Terraform provider) |
+| `registry.terraform.io` | Terraform provider downloads (or internal mirror) |
+
+If outbound internet is restricted to a proxy, set `HTTP_PROXY`/`HTTPS_PROXY`
+on the runner service and add `NO_PROXY=169.254.169.254` (instance metadata).
+
+### Runner software installation
+
+Run these steps on both VMs (adjust if using a different Linux distro):
+
+```bash
+# 1. Install runtime dependencies
+sudo apt-get update && sudo apt-get install -y curl jq git tar unzip
+
+# 2. Install Terraform
+TERRAFORM_VERSION="1.9.5"
+curl -fsSL "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip" \
+  -o /tmp/terraform.zip
+sudo unzip /tmp/terraform.zip -d /usr/local/bin/
+sudo chmod +x /usr/local/bin/terraform
+terraform version
+
+# 3. Install Alibaba Cloud CLI (cloud runner only)
+curl -fsSL https://aliyuncli.alicdn.com/aliyun-cli-linux-latest-amd64.tgz \
+  -o /tmp/aliyun-cli.tgz
+sudo tar -xzf /tmp/aliyun-cli.tgz -C /usr/local/bin/
+aliyun version
+
+# 4. Create a dedicated service account for the runner process
+sudo useradd -m -s /bin/bash github-runner
+```
+
+### GitHub Actions runner agent registration
+
+GitHub Enterprise Cloud generates a one-time registration token per runner.
+Repeat for each VM.
+
+```bash
+# On the runner VM, as the github-runner user:
+sudo su - github-runner
+
+# Download the latest runner agent (check https://github.com/actions/runner/releases)
+RUNNER_VERSION="2.317.0"
+mkdir ~/actions-runner && cd ~/actions-runner
+curl -fsSL "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz" \
+  -o runner.tar.gz
+tar -xzf runner.tar.gz
+
+# Configure – obtain the token from:
+# GHEC org → Settings → Actions → Runners → New self-hosted runner
+./config.sh \
+  --url https://github.com/<YOUR_ORG> \
+  --token <REGISTRATION_TOKEN> \
+  --name lz-corporate-runner-01 \     # or lz-cloud-runner-01
+  --labels self-hosted,corporate \    # or self-hosted,cloud
+  --runnergroup lz-runners \
+  --work _work \
+  --unattended
+
+# Install and start as a systemd service
+sudo ./svc.sh install github-runner
+sudo ./svc.sh start
+sudo ./svc.sh status
+```
+
+### Runner group configuration in GitHub Enterprise Cloud
+
+Runner groups restrict which repositories can use which runners.
+
+1. Go to **Org → Settings → Actions → Runner groups → New runner group**
+2. Create group: `lz-runners`
+3. Access policy: **Selected repositories** → add `cloud-lz-deployment-workflow`
+4. Move both runners into this group
+5. Disable **Allow public repositories** (enterprise policy)
+
+This ensures the LZ deployment runners are not available to other repos in the
+organisation.
+
+### Tool checklist – verify before first pipeline run
+
 ```bash
 ./scripts/validate-prereqs.sh
 ```
+
+All checks must pass on the cloud runner before triggering Day-1 deployment.
 
 ---
 
@@ -223,6 +350,9 @@ The script outputs the three GitHub variable values to configure (see §5).
 ```
 .
 ├── .github/
+│   ├── actions/
+│   │   └── tf-init/
+│   │       └── action.yml        # Composite: download source + setup-terraform + OIDC + init
 │   └── workflows/
 │       ├── lz-pr-validate.yml    # Runs on every PR → validate + plan
 │       ├── lz-deploy.yml         # Merge to main / manual → plan + apply
@@ -401,26 +531,59 @@ Use only for full environment decommission or DR exercises.
 
 ## 7. Day-1 Setup Procedure
 
-Follow these steps in order for first-time deployment.
+Follow these steps **in order**.  Steps 1–4 run on an operator workstation or
+on the cloud runner VM itself (whichever has `aliyun` CLI configured).
+Steps 5 onward require the runners to be registered and healthy first.
 
-### Step 0 – Prerequisites
+```
+Workstation / cloud runner VM          GitHub                  Alibaba Cloud
+──────────────────────────────         ──────                  ─────────────
+Step 1: aliyun configure
+Step 2: setup-oidc.sh          ──────────────────────────▶  Creates OIDC Provider + Role
+Step 3: bootstrap-state.sh     ──────────────────────────▶  Creates OSS bucket + TableStore
+Step 4: runner registration    ──────────────────────────▶  Runner appears in GHEC
+Step 5: drop in LZ IaC
+Step 6: configure tfvars + commit
+Step 7: gh workflow run        ──────────────────────────▶  Pipeline runs on runner
+                                                              ▼ OIDC auth
+                                                              ▼ terraform apply
+Step 8: revoke bootstrap creds ──────────────────────────▶  Disable static AK/SK
+```
 
+### Step 1 – Provision and register self-hosted runners
+
+Before anything else, both VMs must be running and registered.
+Follow §2 (Runner Architecture) for:
+- VM provisioning and software installation
+- Runner agent download and `./config.sh` registration
+- Runner group setup in GHEC
+
+Verify both runners appear as **Idle** in:
+**Org → Settings → Actions → Runners**
+
+Then confirm the cloud runner is ready:
 ```bash
-# On the cloud self-hosted runner (or your workstation):
+# On the cloud runner VM:
 ./scripts/validate-prereqs.sh
 ```
 
-Confirm all checks pass before proceeding.
+All checks must pass before continuing.
 
-### Step 1 – Configure Alibaba Cloud CLI
+### Step 2 – Configure Alibaba Cloud CLI (bootstrap credentials only)
+
+On your workstation or the cloud runner VM:
 
 ```bash
 aliyun configure
-# Enter: AccessKey ID, AccessKey Secret, Region (cn-hangzhou)
-# These are ONE-TIME bootstrap credentials – revoke after setup.
+# Enter: AccessKey ID, AccessKey Secret, Region (e.g. cn-hangzhou)
+# These credentials are used ONLY for Steps 3–4 below.
+# They are revoked in Step 9.
 ```
 
-### Step 2 – Create OIDC Provider and Deployment Role
+The account used here needs RAM admin permissions to create the OIDC Provider,
+Role, OSS bucket, and TableStore instance.
+
+### Step 3 – Create OIDC Provider and Deployment Role
 
 ```bash
 export ALICLOUD_ACCOUNT_ID="<your-account-id>"
@@ -431,9 +594,16 @@ export ALICLOUD_REGION="cn-hangzhou"
 ./scripts/setup-oidc.sh
 ```
 
-Copy the output values into GitHub repository Variables (see §5).
+The script prints three values at the end.  Add them to:
+**GitHub repo → Settings → Secrets and variables → Actions → Variables**
 
-### Step 3 – Bootstrap Terraform State Backend
+| Variable | Value from script output |
+|----------|--------------------------|
+| `ALICLOUD_OIDC_PROVIDER_ARN` | `acs:ram::...:oidc-provider/GitHubActions` |
+| `ALICLOUD_OIDC_ROLE_ARN` | `acs:ram::...:role/github-lz-deploy` |
+| `ALICLOUD_REGION` | e.g. `cn-hangzhou` |
+
+### Step 4 – Bootstrap Terraform State Backend
 
 ```bash
 export ALICLOUD_ACCOUNT_ID="<your-account-id>"
@@ -445,47 +615,82 @@ export TABLESTORE_TABLE="terraform-lock"
 ./scripts/bootstrap-state-backend.sh
 ```
 
-Copy the output values into GitHub repository Variables (see §5).
+Add the three output values to GitHub repository Variables:
 
-### Step 4 – Drop in Alibaba Cloud LZ IaC
+| Variable | Value from script output |
+|----------|--------------------------|
+| `TF_STATE_BUCKET` | OSS bucket name |
+| `TF_LOCK_TABLESTORE_ENDPOINT` | TableStore HTTPS endpoint |
+| `TF_LOCK_TABLE` | Table name (`terraform-lock`) |
+
+### Step 5 – Drop in Alibaba Cloud LZ IaC
 
 Place the Alibaba Cloud–provided LZ IaC files into:
 ```
 terraform/environments/landing-zone/
 ```
 
-Refer to `terraform/environments/landing-zone/README.md` for the expected
-layout.
+See `terraform/environments/landing-zone/README.md` for the expected layout.
 
-### Step 5 – Configure Variable Values
+### Step 6 – Configure and commit variable values
 
 ```bash
 cp terraform/environments/landing-zone/landing-zone.tfvars.example \
    terraform/environments/landing-zone/landing-zone.tfvars
-# Edit landing-zone.tfvars with your environment values
+# Edit landing-zone.tfvars – fill in account IDs, CIDRs, names, etc.
 ```
 
-Commit `landing-zone.tfvars` (it contains no secrets).
-
-### Step 6 – Trigger the First Deploy
+Commit to a feature branch and open a PR.  This triggers `lz-pr-validate` and
+posts a Terraform plan as a PR comment so you can review what will be created
+before Day-1 apply.
 
 ```bash
-# Via GitHub CLI:
-gh workflow run lz-deploy.yml \
-  --field environment=landing-zone \
-  --ref main
+git checkout -b feat/initial-lz-config
+git add terraform/environments/landing-zone/landing-zone.tfvars
+git commit -m "chore: initial landing zone variable configuration"
+git push -u origin feat/initial-lz-config
+# Open PR → review the plan comment → merge to main
 ```
 
-Or use the GitHub UI: **Actions → LZ – Deploy → Run workflow**.
+### Step 7 – Trigger the first deploy
 
-Monitor the run.  The workflow will pause at the **lz-deploy** environment gate
-awaiting human approval before applying.
+Merging to `main` in Step 6 triggers `lz-deploy.yml` automatically.
+Alternatively, trigger manually:
 
-### Step 7 – Revoke Bootstrap Credentials
+```bash
+gh workflow run lz-deploy.yml --ref main
+```
 
-After the pipeline is running on OIDC, revoke or disable the static
-`AccessKey`/`SecretKey` used in Steps 2–3.  All subsequent CI/CD operations
-use OIDC-derived short-lived tokens only.
+The workflow pauses at the **lz-deploy** environment gate.  An approver must
+go to **Actions → the run → Review deployments** and approve.  After approval
+the apply job runs and creates the landing zone.
+
+### Step 8 – Verify
+
+```bash
+# Check the apply log artifact in the completed workflow run
+gh run view --log <RUN_ID>
+
+# Confirm state was written
+aliyun oss ls oss://<STATE_BUCKET_NAME>/landing-zone/
+```
+
+Confirm in the Alibaba Cloud console that the expected resources exist
+(Resource Directory folders, VPC, CEN, logging, etc.).
+
+### Step 9 – Revoke bootstrap credentials
+
+The static `AccessKey`/`SecretKey` used in Steps 2–4 are no longer needed.
+
+```bash
+# Disable (preferred – reversible) or delete the bootstrap AK
+aliyun ram UpdateAccessKey \
+  --UserName <bootstrap-user> \
+  --UserAccessKeyId <AK_ID> \
+  --Status Inactive
+```
+
+All subsequent pipeline runs authenticate exclusively via OIDC → STS.
 
 ---
 
