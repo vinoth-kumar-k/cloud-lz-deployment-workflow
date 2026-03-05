@@ -1,0 +1,51 @@
+name: Terraform Init
+description: >
+  Downloads the IaC source artifact, sets up Terraform, authenticates with
+  Alibaba Cloud via GitHub OIDC, and initialises the OSS remote backend.
+  Used by every cloud-runner job that needs to run Terraform operations.
+
+inputs:
+  artifact-name:
+    description: Source artifact name produced by the fetch-source job
+    required: true
+  session-name:
+    description: STS role session name – must be unique per job
+    required: true
+  working-dir:
+    description: Terraform working directory relative to the repo root
+    required: true
+  duration:
+    description: STS session duration in seconds
+    default: "3600"
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}
+
+    - shell: bash
+      run: tar -xzf lz-source.tar.gz
+
+    - uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: "1.9.5"
+        terraform_wrapper: false
+
+    - uses: aliyun/credentials@v1
+      with:
+        role-to-assume: ${{ vars.ALICLOUD_OIDC_ROLE_ARN }}
+        oidc-provider-arn: ${{ vars.ALICLOUD_OIDC_PROVIDER_ARN }}
+        role-session-name: ${{ inputs.session-name }}
+        role-duration-seconds: ${{ inputs.duration }}
+
+    - shell: bash
+      working-directory: ${{ inputs.working-dir }}
+      run: |
+        terraform init \
+          -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+          -backend-config="prefix=landing-zone/terraform.tfstate" \
+          -backend-config="region=${{ vars.ALICLOUD_REGION }}" \
+          -backend-config="tablestore_endpoint=${{ vars.TF_LOCK_TABLESTORE_ENDPOINT }}" \
+          -backend-config="tablestore_table=${{ vars.TF_LOCK_TABLE }}"

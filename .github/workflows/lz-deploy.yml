@@ -1,0 +1,143 @@
+name: LZ – Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Terraform -target (leave blank for full apply)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+  deployments: write
+
+concurrency:
+  group: lz-deploy
+  cancel-in-progress: false  # never cancel an in-flight deploy
+
+env:
+  TF_WORKING_DIR: terraform/environments/landing-zone
+
+jobs:
+  # ── Corporate runner: checkout and package source ──────────
+  fetch-source:
+    runs-on: [self-hosted, corporate]
+    outputs:
+      artifact-name: ${{ steps.pkg.outputs.artifact-name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: pkg
+        shell: bash
+        run: |
+          echo "artifact-name=lz-source-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+          tar --exclude='.git' --exclude='**/.terraform' --exclude='**/*.tfstate*' \
+              -czf /tmp/lz-source.tar.gz .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.artifact-name }}
+          path: /tmp/lz-source.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+
+  # ── Cloud runner: plan ─────────────────────────────────────
+  plan:
+    needs: fetch-source
+    runs-on: [self-hosted, cloud]
+    environment: lz-plan
+    outputs:
+      plan-artifact: ${{ steps.save.outputs.name }}
+      has-changes: ${{ steps.plan.outputs.has-changes }}
+    steps:
+      - uses: ./.github/actions/tf-init
+        with:
+          artifact-name: ${{ needs.fetch-source.outputs.artifact-name }}
+          session-name: gh-lz-plan-${{ github.run_id }}
+          working-dir: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          TARGET_ARG=""
+          [[ -n "${{ inputs.target }}" ]] && TARGET_ARG="-target=${{ inputs.target }}"
+
+          set +e
+          terraform plan -var-file=landing-zone.tfvars ${TARGET_ARG} \
+            -out=tfplan -detailed-exitcode -no-color 2>&1 | tee plan-output.txt
+          EC=${PIPESTATUS[0]}
+          set -e
+
+          echo "has-changes=$([ $EC -eq 2 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          [ $EC -eq 1 ] && exit 1 || exit 0
+
+      - id: save
+        run: echo "name=tfplan-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.save.outputs.name }}
+          path: |
+            ${{ env.TF_WORKING_DIR }}/tfplan
+            ${{ env.TF_WORKING_DIR }}/plan-output.txt
+          retention-days: 5
+          if-no-files-found: error
+
+      - name: Plan summary
+        run: |
+          echo '### Terraform Plan' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -30 ${{ env.TF_WORKING_DIR }}/plan-output.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Human approval gate (GitHub Environment) ───────────────
+  await-approval:
+    needs: plan
+    if: needs.plan.outputs.has-changes == 'true'
+    runs-on: [self-hosted, cloud]
+    environment: lz-deploy
+    steps:
+      - run: "echo Approved – run ${{ github.run_id }}"
+
+  # ── Cloud runner: apply the saved plan ─────────────────────
+  apply:
+    needs: [fetch-source, plan, await-approval]
+    if: needs.plan.outputs.has-changes == 'true'
+    runs-on: [self-hosted, cloud]
+    steps:
+      - uses: ./.github/actions/tf-init
+        with:
+          artifact-name: ${{ needs.fetch-source.outputs.artifact-name }}
+          session-name: gh-lz-apply-${{ github.run_id }}
+          working-dir: ${{ env.TF_WORKING_DIR }}
+          duration: "7200"  # approval wait may exceed 1 h
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.plan.outputs.plan-artifact }}
+
+      - name: Terraform Apply
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -no-color tfplan 2>&1 | tee apply-output.txt
+
+      - name: Apply summary
+        if: always()
+        run: |
+          echo '### Terraform Apply' >> "$GITHUB_STEP_SUMMARY"
+          echo "Actor: ${{ github.actor }} | Commit: ${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -50 ${{ env.TF_WORKING_DIR }}/apply-output.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: apply-log-${{ github.run_id }}
+          retention-days: 30

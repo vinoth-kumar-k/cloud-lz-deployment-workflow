@@ -1,0 +1,60 @@
+# -----------------------------------------------------------
+# Example variable values for the Alibaba Cloud Landing Zone.
+#
+# Copy this file to landing-zone.tfvars (git-ignored) and
+# populate with your environment values before first run.
+# In CI/CD, this file is stored in the repository and does
+# NOT contain secrets – all sensitive values come from
+# GitHub Actions variables/secrets.
+# -----------------------------------------------------------
+
+# ── Identity ────────────────────────────────────────────────
+# Alibaba Cloud account ID (the management / master account)
+alicloud_account_id = "123456789012"
+
+# Region for landing-zone control-plane resources
+alicloud_region = "cn-hangzhou"
+
+# ── Naming & Tagging ────────────────────────────────────────
+environment   = "landing-zone"
+organisation  = "acme-corp"
+project       = "cloud-lz"
+cost_centre   = "IT-INFRA"
+owner         = "platform-team@acme-corp.com"
+
+# ── Resource Directory (multi-account) ─────────────────────
+# Root folder name for the Organisation hierarchy
+rd_root_folder_name = "acme-root"
+
+# Map of business-unit folders to create under root
+# rd_folders = {
+#   "security"    = { display_name = "Security" }
+#   "platform"    = { display_name = "Platform" }
+#   "workloads"   = { display_name = "Workloads" }
+#   "sandbox"     = { display_name = "Sandbox" }
+# }
+
+# ── Network Foundation ──────────────────────────────────────
+# Hub VPC CIDR (Transit Router attaches here)
+hub_vpc_cidr        = "10.0.0.0/16"
+hub_vpc_region      = "cn-hangzhou"
+
+# Secondary / DR region (optional)
+# dr_vpc_region       = "cn-beijing"
+# dr_vpc_cidr         = "10.1.0.0/16"
+
+# ── Security Baseline ───────────────────────────────────────
+# ActionTrail destination OSS bucket (created by logging module)
+actiontrail_oss_bucket = "acme-lz-actiontrail-logs"
+
+# CloudMonitor alert contact email
+alert_contact_email = "platform-alerts@acme-corp.com"
+
+# ── Logging Foundation ──────────────────────────────────────
+# Centralised log store (SLS project name)
+sls_project_name    = "acme-lz-central-logs"
+log_retention_days  = 365
+
+# ── Break-glass / Emergency Access ─────────────────────────
+# RAM user for emergency break-glass (MFA enforced)
+# breakglass_user_email = "breakglass@acme-corp.com"

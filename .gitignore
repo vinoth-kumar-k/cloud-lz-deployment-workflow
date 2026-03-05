@@ -1,0 +1,43 @@
+# Terraform
+**/.terraform/
+**/.terraform.lock.hcl
+*.tfstate
+*.tfstate.backup
+*.tfplan
+tfplan
+*.tfvars
+!*.tfvars.example
+
+# Override files (local dev only)
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Crash log
+crash.log
+crash.*.log
+
+# Sensitive files – never commit these
+*.pem
+*.key
+*.p12
+*.pfx
+secrets.yml
+secrets.yaml
+.env
+.env.*
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temp
+/tmp/
+*.tar.gz
+!landing-zone.tfvars

@@ -1,0 +1,121 @@
+name: LZ – Destroy (Emergency)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type 'DESTROY-LANDING-ZONE' to confirm"
+        required: true
+      reason:
+        description: "Reason for destroy (audit trail)"
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: lz-destroy
+  cancel-in-progress: false
+
+env:
+  TF_WORKING_DIR: terraform/environments/landing-zone
+
+jobs:
+  # ── Guard: validate confirmation string before anything else
+  validate-confirmation:
+    runs-on: [self-hosted, cloud]
+    steps:
+      - name: Check confirmation
+        run: |
+          if [[ "${{ inputs.confirmation }}" != "DESTROY-LANDING-ZONE" ]]; then
+            echo "::error::Confirmation string incorrect. Aborting."
+            exit 1
+          fi
+          echo "Confirmed. Reason on record: ${{ inputs.reason }}"
+
+  # ── Corporate runner: checkout and package source ──────────
+  fetch-source:
+    needs: validate-confirmation
+    runs-on: [self-hosted, corporate]
+    outputs:
+      artifact-name: ${{ steps.pkg.outputs.artifact-name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: pkg
+        shell: bash
+        run: |
+          echo "artifact-name=lz-source-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+          tar --exclude='.git' --exclude='**/.terraform' --exclude='**/*.tfstate*' \
+              -czf /tmp/lz-source.tar.gz .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.artifact-name }}
+          path: /tmp/lz-source.tar.gz
+          retention-days: 1
+
+  # ── Cloud runner: destroy plan ─────────────────────────────
+  plan-destroy:
+    needs: fetch-source
+    runs-on: [self-hosted, cloud]
+    outputs:
+      plan-artifact: ${{ steps.save.outputs.name }}
+    steps:
+      - uses: ./.github/actions/tf-init
+        with:
+          artifact-name: ${{ needs.fetch-source.outputs.artifact-name }}
+          session-name: gh-lz-destroy-plan-${{ github.run_id }}
+          working-dir: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Plan (destroy)
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform plan -var-file=landing-zone.tfvars -destroy \
+            -out=tfplan -no-color 2>&1 | tee plan-output.txt
+
+      - id: save
+        run: echo "name=tfplan-destroy-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.save.outputs.name }}
+          path: |
+            ${{ env.TF_WORKING_DIR }}/tfplan
+            ${{ env.TF_WORKING_DIR }}/plan-output.txt
+          retention-days: 5
+
+  # ── Human approval gate ─────────────────────────────────────
+  await-approval:
+    needs: plan-destroy
+    runs-on: [self-hosted, cloud]
+    environment: lz-destroy
+    steps:
+      - run: "echo Destruction approved. Reason: ${{ inputs.reason }}"
+
+  # ── Cloud runner: execute destroy ──────────────────────────
+  execute-destroy:
+    needs: [fetch-source, plan-destroy, await-approval]
+    runs-on: [self-hosted, cloud]
+    steps:
+      - uses: ./.github/actions/tf-init
+        with:
+          artifact-name: ${{ needs.fetch-source.outputs.artifact-name }}
+          session-name: gh-lz-destroy-apply-${{ github.run_id }}
+          working-dir: ${{ env.TF_WORKING_DIR }}
+          duration: "7200"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.plan-destroy.outputs.plan-artifact }}
+
+      - name: Terraform Destroy
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -no-color tfplan 2>&1 | tee destroy-output.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: destroy-log-${{ github.run_id }}
+          retention-days: 90
