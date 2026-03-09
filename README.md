@@ -6,6 +6,8 @@ with GitHub Enterprise Cloud, an AKS self-hosted runner for code checkout, and
 GitHub-hosted runners for Terraform operations.  Authentication uses
 **GitHub OIDC** (no static cloud credentials stored anywhere).
 
+> For full architectural details, see [DESIGN.md](DESIGN.md).
+
 ---
 
 ## Table of Contents
@@ -25,48 +27,42 @@ GitHub-hosted runners for Terraform operations.  Authentication uses
 
 ## 1. Architecture Overview
 
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│  GitHub Enterprise Cloud                                                 │
-│                                                                          │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  Repository: cloud-lz-deployment-workflow                        │    │
-│  │  Branches: main (protected) ← feature/* ← PRs                   │    │
-│  │  Environments: lz-plan / lz-deploy / lz-destroy                  │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-│  Workflows: lz-pr-validate / lz-deploy / lz-drift-detect / lz-destroy  │
-└──────────────┬───────────────────────────────────────────┬─────────────┘
-               │                                           │
-               │ fetch-source job                          │ Cloud jobs
-               ▼                                           ▼
-┌──────────────────────────┐              ┌──────────────────────────────┐
-│  AKS Runner              │              │  GitHub-hosted Runner        │
-│  Labels: self-hosted, aks│              │  (ubuntu-22.04)              │
-│                          │              │                              │
-│  ● Inside corporate      │              │  ● Full internet access      │
-│    network (Azure K8s)   │              │  ● Pre-installed tools       │
-│  ● Checkout code from    │              │  ● OIDC → STS auth           │
-│    internal repos        │              │  ● Terraform init/plan/apply │
-│  ● Package + upload      │              └──────────────┬───────────────┘
-│    artifact              │                             │
-└──────────┬───────────────┘                             │ OIDC token
-           │ Upload artifact                             │ exchange
-           ▼                                             ▼
-┌──────────────────────────┐              ┌──────────────────────────────┐
-│  GitHub Artifact Store   │              │  Alibaba Cloud               │
-│  (encrypted at rest)     │──download──▶ │                              │
-└──────────────────────────┘              │  STS → temp credentials      │
-                                          │  ResourceDirectory / RAM     │
-                                          │  VPC / CEN / SLS / OSS      │
-                                          └──────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph GHEC["GitHub Enterprise Cloud"]
+        REPO["Repository<br/>cloud-lz-deployment-workflow"]
+        WF["Workflows<br/>pr-validate · deploy · drift-detect · destroy"]
+    end
+
+    subgraph CORP["Corporate Network"]
+        AKS["AKS Runner<br/><i>self-hosted, aks</i><br/>Checkout + package artifact"]
+    end
+
+    subgraph GH_INFRA["GitHub Infrastructure"]
+        GHR["GitHub-hosted Runner<br/><i>ubuntu-22.04</i><br/>Terraform init / plan / apply"]
+        ARTIFACTS["GitHub Artifact Store<br/><i>encrypted at rest</i>"]
+    end
+
+    subgraph ALI["Alibaba Cloud"]
+        STS["STS<br/>OIDC token exchange"]
+        SERVICES["Cloud Services<br/>ResourceDirectory · RAM · VPC<br/>CEN · SLS · OSS"]
+        STATE["State Backend<br/>OSS + TableStore"]
+    end
+
+    REPO --> WF
+    WF -->|fetch-source job| AKS
+    WF -->|cloud jobs| GHR
+    AKS -->|upload| ARTIFACTS
+    ARTIFACTS -->|download| GHR
+    GHR -->|"OIDC JWT"| STS
+    STS -->|"temp credentials<br/>(1h TTL)"| GHR
+    GHR -->|"Terraform API calls"| SERVICES
+    GHR -->|"state read/write"| STATE
 ```
 
 ---
 
 ## 2. Runner Architecture
-
-### Labels and responsibilities
 
 | Runner | `runs-on` | Responsibilities |
 |--------|-----------|-----------------|
@@ -83,18 +79,8 @@ to Alibaba Cloud via short-lived OIDC tokens – it stores no long-lived
 credentials.
 
 Because the cloud runner is GitHub-hosted, there is no VM provisioning,
-software installation, or network configuration required.  The runner
-comes pre-installed with standard tools, and additional tools (Terraform,
-Alibaba Cloud CLI) are installed via workflow steps (`hashicorp/setup-terraform`).
-
-### Tool checklist – verify CI readiness
-
-```bash
-./scripts/validate-prereqs.sh
-```
-
-This script validates that required tools and environment variables are
-available in the CI context.
+software installation, or network configuration required.  Terraform is
+installed via `hashicorp/setup-terraform@v3` in the composite action.
 
 ---
 
@@ -105,33 +91,21 @@ Authentication uses the **GitHub OIDC → Alibaba Cloud STS** federation chain.
 
 ### How it works
 
-```
-GitHub Actions workflow
-        │
-        │  1. Request OIDC token
-        │     audience = "sts.aliyuncs.com"
-        ▼
-GitHub OIDC endpoint
-https://token.actions.githubusercontent.com
-        │
-        │  2. Return signed JWT
-        │     sub = "repo:ORG/REPO:ref:refs/heads/main"
-        │     aud = "sts.aliyuncs.com"
-        │     iss = "https://token.actions.githubusercontent.com"
-        ▼
-  GitHub Actions step
-  aliyun/alibaba-cloud-setup-credentials@v1
-        │
-        │  3. POST token to STS AssumeRoleWithOIDC
-        ▼
-Alibaba Cloud STS
-        │
-        │  4. Validate token signature against RAM OIDC Provider thumbprint
-        │  5. Validate aud + sub claim conditions
-        │  6. Return temp creds (AccessKey + SecretKey + SecurityToken, 1h TTL)
-        ▼
-  Terraform provider picks up creds via environment variables
-  ALICLOUD_ACCESS_KEY, ALICLOUD_SECRET_KEY, ALICLOUD_SECURITY_TOKEN
+```mermaid
+sequenceDiagram
+    participant WF as GitHub Actions Workflow
+    participant OIDC as GitHub OIDC Endpoint
+    participant Action as aliyun/configure-aliyun-<br/>credentials-action@v1
+    participant STS as Alibaba Cloud STS
+    participant TF as Terraform
+
+    WF->>OIDC: 1. Request OIDC token (audience: sts.aliyuncs.com)
+    OIDC-->>Action: 2. Return signed JWT (sub, aud, iss claims)
+    Action->>STS: 3. POST AssumeRoleWithOIDC (JWT + Role ARN)
+    STS->>STS: 4. Validate signature, aud, sub conditions
+    STS-->>Action: 5. Return temp credentials (1h TTL)
+    Action->>TF: 6. Set env vars (ALICLOUD_ACCESS_KEY, SECRET_KEY, SECURITY_TOKEN)
+    TF->>STS: 7. API calls with temp credentials
 ```
 
 ### RAM OIDC Provider configuration
@@ -168,14 +142,6 @@ Alibaba Cloud STS
 }
 ```
 
-The `StringLike` condition on `oidc:sub` ensures only workflows from **this
-specific repository** can assume the role.  Tighten further by restricting to a
-specific branch or environment:
-
-```json
-"oidc:sub": "repo:YOUR_ORG/cloud-lz-deployment-workflow:ref:refs/heads/main"
-```
-
 ### One-time setup
 
 ```bash
@@ -198,39 +164,32 @@ The script outputs the three GitHub variable values to configure (see §5).
 ├── .github/
 │   ├── actions/
 │   │   └── tf-init/
-│   │       └── action.yml        # Composite: download source + setup-terraform + OIDC + init
+│   │       └── action.yml          # Composite: download + setup-terraform + OIDC + init
 │   └── workflows/
-│       ├── lz-pr-validate.yml    # Runs on every PR → validate + plan
-│       ├── lz-deploy.yml         # Merge to main / manual → plan + apply
-│       ├── lz-drift-detect.yml   # Daily cron → detect config drift
-│       └── lz-destroy.yml        # Manual only → guarded destroy
+│       ├── lz-pr-validate.yml      # PR → static analysis + plan
+│       ├── lz-deploy.yml           # Merge to main / manual → plan + approve + apply
+│       ├── lz-drift-detect.yml     # Daily cron → drift detection + alerting
+│       └── lz-destroy.yml          # Manual → confirmation + approve + destroy
 │
 ├── terraform/
 │   └── environments/
 │       └── landing-zone/
-│           ├── README.md                      # Drop-zone instructions
-│           ├── backend.tf                     # OSS backend template
-│           ├── landing-zone.tfvars            # Environment values (committed)
-│           └── landing-zone.tfvars.example    # Reference template
-│           └── <Alibaba LZ IaC files here>    # Provided by Alibaba Cloud
+│           ├── backend.tf                    # OSS backend template (values injected at runtime)
+│           ├── landing-zone.tfvars.example   # Reference variable template
+│           └── <Alibaba LZ IaC files>        # Provided by Alibaba Cloud
 │
 ├── scripts/
-│   ├── setup-oidc.sh                # Creates RAM OIDC Provider + Role
-│   ├── bootstrap-state-backend.sh   # Creates OSS bucket + TableStore
-│   └── validate-prereqs.sh          # Checks runner readiness
+│   ├── setup-oidc.sh                # Day-1: creates RAM OIDC Provider + Deployment Role
+│   ├── bootstrap-state-backend.sh   # Day-1: creates OSS bucket + TableStore instance/table
+│   └── validate-prereqs.sh          # CI validation: checks tools + env vars + OIDC
 │
-└── README.md
+├── DESIGN.md                        # Architecture and design document
+└── README.md                        # This file
 ```
 
 ---
 
 ## 5. GitHub Repository Configuration
-
-### Required Permissions
-
-The workflows require `id-token: write` at the workflow level.  This is already
-set in each workflow file.  Your GitHub Enterprise Cloud organisation policy
-must **not** block OIDC token generation.
 
 ### Variables (Settings → Secrets and variables → Actions → Variables)
 
@@ -247,35 +206,21 @@ These are non-sensitive and stored as plain variables, not secrets.
 
 ### Environments (Settings → Environments)
 
-Create three environments with the following protection rules:
-
-#### `lz-plan`
-- No required reviewers
-- Allowed branches: `main`, `feature/*`
-- Purpose: gates the terraform plan job (provides separation of OIDC session)
-
-#### `lz-deploy`
-- **Required reviewers**: minimum 1 (e.g., platform-lead or a team)
-- **Allowed branches**: `main` only
-- **Wait timer**: optional (e.g., 5 minutes for last-chance cancel)
-- Purpose: human approval gate before terraform apply
-
-#### `lz-destroy`
-- **Required reviewers**: minimum 2 (senior team members)
-- **Allowed branches**: `main` only
-- **Deployment branch policy**: selected branches (`main`)
-- Purpose: approval gate for destructive operations
+| Environment | Required reviewers | Allowed branches | Purpose |
+|-------------|-------------------|-----------------|---------|
+| `lz-plan` | None | `main`, `feature/*` | OIDC session separation for plan jobs |
+| `lz-deploy` | ≥1 (platform-lead / team) | `main` only | Human approval gate before apply |
+| `lz-destroy` | ≥2 (senior team members) | `main` only | Approval gate for destructive operations |
 
 ### Branch Protection (Settings → Branches → `main`)
 
 | Rule | Value |
 |------|-------|
-| Require PR before merging | ✓ |
+| Require PR before merging | Yes |
 | Require status checks | `Static Analysis`, `Terraform Plan` |
-| Require branches to be up to date | ✓ |
-| Restrict force pushes | ✓ |
-| Restrict deletions | ✓ |
-| Require linear history | recommended |
+| Require branches to be up to date | Yes |
+| Restrict force pushes | Yes |
+| Restrict deletions | Yes |
 
 ---
 
@@ -283,93 +228,65 @@ Create three environments with the following protection rules:
 
 ### `lz-pr-validate.yml` – PR Validation
 
-Runs on every PR targeting `main` that modifies `terraform/**`.
+Runs on every PR targeting `main` that modifies `terraform/**` or `.github/**`.
 
+```mermaid
+flowchart TD
+    PR["PR opened / updated"] --> FS["<b>fetch-source</b><br/><i>AKS runner</i><br/>Checkout · package · upload"]
+    FS --> SA["<b>static-analysis</b><br/><i>GitHub-hosted runner</i><br/>terraform fmt -check<br/>terraform validate"]
+    SA --> PLAN["<b>plan</b><br/><i>GitHub-hosted · lz-plan</i><br/>OIDC → STS<br/>terraform plan<br/>Post plan as PR comment"]
+    PLAN --> DONE["Done — reviewer sees plan on PR"]
 ```
-PR opened / updated
-       │
-       ▼
-[AKS runner] fetch-source
-       │  Upload artifact
-       ▼
-[GitHub-hosted runner] static-analysis
-       │  terraform fmt -check
-       │  terraform validate
-       │  checkov security scan (SARIF → Security tab)
-       │
-       ▼
-[GitHub-hosted runner] plan  (environment: lz-plan)
-       │  OIDC → STS credentials
-       │  terraform init (OSS backend)
-       │  terraform plan -out tfplan
-       │  Post plan summary as PR comment
-       ▼
-      Done
-```
-
-**Outcome**: reviewer sees plan output inline on the PR before approving merge.
 
 ---
 
 ### `lz-deploy.yml` – Deploy
 
-Triggers on:
-- Push to `main` (IaC file changes)
-- `workflow_dispatch` (manual, for Day-1 or targeted runs)
+Triggers on push to `main` (IaC changes) or `workflow_dispatch` (manual).
 
-```
-Push to main / manual trigger
-       │
-       ▼
-[AKS runner] fetch-source
-       │
-       ▼
-[GitHub-hosted runner] plan  (environment: lz-plan)
-       │  OIDC → STS
-       │  terraform plan -out tfplan
-       │  Detect if changes exist
-       │
-       ▼ (if changes detected)
-[GitHub-hosted runner] await-approval  (environment: lz-deploy)
-       │  ← Human approval required here
-       │
-       ▼
-[GitHub-hosted runner] apply
-       │  Fresh OIDC → STS (previous session may have expired)
-       │  terraform apply tfplan   (applies the exact saved plan)
-       │  Upload apply log (retained 30 days)
-       ▼
-      Done
+```mermaid
+flowchart TD
+    TRIGGER["Push to main / manual trigger"] --> FS["<b>fetch-source</b><br/><i>AKS runner</i>"]
+    FS --> PLAN["<b>plan</b><br/><i>GitHub-hosted · lz-plan</i><br/>terraform plan -detailed-exitcode"]
+    PLAN -->|"has-changes = true"| APPROVE["<b>await-approval</b><br/><i>lz-deploy environment</i><br/>⏸ ≥1 reviewer must approve"]
+    PLAN -->|"has-changes = false"| SKIP["Skip — no changes"]
+    APPROVE --> APPLY["<b>apply</b><br/><i>GitHub-hosted runner</i><br/>Fresh OIDC → STS<br/>terraform apply tfplan"]
 ```
 
 Key design decisions:
-- The **exact plan binary** produced in the plan job is downloaded and applied –
-  no re-plan on apply, ensuring what was reviewed is what gets applied.
-- `concurrency: cancel-in-progress: false` prevents a deploy from being
-  cancelled mid-run by a subsequent push.
-- Fresh OIDC token is obtained for the apply job independently (STS tokens
-  are valid for 1 hour; the approval wait may exceed this).
+- The **exact plan binary** is applied – no re-plan on apply.
+- `concurrency: cancel-in-progress: false` prevents mid-deploy cancellation.
+- Fresh OIDC token for apply (approval wait may exceed 1h TTL).
 
 ---
 
 ### `lz-drift-detect.yml` – Drift Detection
 
-Runs daily at 04:00 UTC.  Can also be triggered manually.
+Runs daily at 04:00 UTC or manually.
 
-- Runs `terraform plan -detailed-exitcode`
-- Exit code 2 = changes detected (drift)
-- Creates or updates a GitHub Issue labelled `drift-alert` if drift is found
-- Uploads the full plan output as an artifact (retained 14 days)
+```mermaid
+flowchart TD
+    TRIGGER["Scheduled / manual"] --> FS["<b>fetch-source</b><br/><i>AKS runner</i>"]
+    FS --> DRIFT["<b>drift-check</b><br/><i>GitHub-hosted runner</i><br/>terraform plan -detailed-exitcode"]
+    DRIFT -->|"no changes"| OK["Done"]
+    DRIFT -->|"drift detected"| ALERT["<b>alert</b><br/>Create/update GitHub Issue<br/>Labels: drift-alert"]
+```
 
 ---
 
 ### `lz-destroy.yml` – Emergency Destroy
 
-**Manual trigger only.**  Hard-gated by:
+**Manual trigger only.** Triple-gated:
 
-1. Confirmation string `DESTROY-LANDING-ZONE` required as input
-2. GitHub Environment `lz-destroy` with ≥2 required reviewers
-3. Audit trail: reason field is mandatory and captured in the workflow log
+```mermaid
+flowchart TD
+    TRIGGER["Manual trigger"] --> G1["<b>Gate 1</b><br/>confirmation == DESTROY-LANDING-ZONE?"]
+    G1 -->|"✗"| ABORT["Abort"]
+    G1 -->|"✓"| FS["<b>fetch-source</b><br/><i>AKS runner</i>"]
+    FS --> PLAN["<b>plan-destroy</b><br/>terraform plan -destroy"]
+    PLAN --> G2["<b>Gate 2</b><br/><i>lz-destroy environment</i><br/>⏸ ≥2 reviewers must approve"]
+    G2 --> DESTROY["<b>execute-destroy</b><br/>terraform apply tfplan"]
+```
 
 Use only for full environment decommission or DR exercises.
 
@@ -377,49 +294,35 @@ Use only for full environment decommission or DR exercises.
 
 ## 7. Day-1 Setup Procedure
 
-Follow these steps **in order**.  Steps 1–3 run on an operator workstation
-(whichever has `aliyun` CLI configured).  Steps 4 onward require the AKS
-runner to be registered and healthy.
+Follow these steps **in order**.
 
-```
-Workstation                            GitHub                  Alibaba Cloud
-───────────                            ──────                  ─────────────
-Step 1: Verify AKS runner                                     (already registered)
-Step 2: aliyun configure
-Step 3: setup-oidc.sh          ──────────────────────────▶  Creates OIDC Provider + Role
-Step 4: bootstrap-state.sh     ──────────────────────────▶  Creates OSS bucket + TableStore
-Step 5: drop in LZ IaC
-Step 6: configure tfvars + commit
-Step 7: gh workflow run        ──────────────────────────▶  Pipeline runs
-                                                              ▼ OIDC auth
-                                                              ▼ terraform apply
-Step 8: revoke bootstrap creds ──────────────────────────▶  Disable static AK/SK
+```mermaid
+flowchart TD
+    S1["<b>Step 1</b> — Verify AKS runner registered"] --> S2["<b>Step 2</b> — Configure Alibaba CLI"]
+    S2 --> S3["<b>Step 3</b> — Run setup-oidc.sh"]
+    S3 --> S4["<b>Step 4</b> — Run bootstrap-state-backend.sh"]
+    S4 --> S5["<b>Step 5</b> — Configure GitHub (vars + environments)"]
+    S5 --> S6["<b>Step 6</b> — Drop in LZ IaC + configure tfvars"]
+    S6 --> S7["<b>Step 7</b> — Open PR → review plan → merge"]
+    S7 --> S8["<b>Step 8</b> — Approve deploy + verify"]
+    S8 --> S9["<b>Step 9</b> — Revoke bootstrap credentials"]
 ```
 
 ### Step 1 – Verify the AKS runner is registered
 
 Ensure the AKS self-hosted runner is registered in GitHub Enterprise with
-labels `self-hosted, aks`.  Refer to your organisation's AKS runner
-documentation for provisioning details.
-
-Verify the runner appears as **Idle** in:
+labels `self-hosted, aks`.  Verify it appears as **Idle** in:
 **Org → Settings → Actions → Runners**
 
-Cloud jobs use GitHub-hosted runners (`ubuntu-22.04`) and require no setup.
+Cloud jobs use GitHub-hosted runners and require no setup.
 
-### Step 2 – Configure Alibaba Cloud CLI (bootstrap credentials only)
-
-On your workstation:
+### Step 2 – Configure Alibaba Cloud CLI
 
 ```bash
 aliyun configure
 # Enter: AccessKey ID, AccessKey Secret, Region (e.g. cn-hangzhou)
-# These credentials are used ONLY for Steps 3–4 below.
-# They are revoked in Step 9.
+# Temporary — revoked in Step 9.
 ```
-
-The account used here needs RAM admin permissions to create the OIDC Provider,
-Role, OSS bucket, and TableStore instance.
 
 ### Step 3 – Create OIDC Provider and Deployment Role
 
@@ -432,14 +335,7 @@ export ALICLOUD_REGION="cn-hangzhou"
 ./scripts/setup-oidc.sh
 ```
 
-The script prints three values at the end.  Add them to:
-**GitHub repo → Settings → Secrets and variables → Actions → Variables**
-
-| Variable | Value from script output |
-|----------|--------------------------|
-| `ALICLOUD_OIDC_PROVIDER_ARN` | `acs:ram::...:oidc-provider/GitHubActions` |
-| `ALICLOUD_OIDC_ROLE_ARN` | `acs:ram::...:role/github-lz-deploy` |
-| `ALICLOUD_REGION` | e.g. `cn-hangzhou` |
+Save the three output values for Step 5.
 
 ### Step 4 – Bootstrap Terraform State Backend
 
@@ -453,82 +349,57 @@ export TABLESTORE_TABLE="terraform_lock"
 ./scripts/bootstrap-state-backend.sh
 ```
 
-Add the three output values to GitHub repository Variables:
+Save the three output values for Step 5.
 
-| Variable | Value from script output |
-|----------|--------------------------|
-| `TF_STATE_BUCKET` | OSS bucket name |
-| `TF_LOCK_TABLESTORE_ENDPOINT` | TableStore HTTPS endpoint |
-| `TF_LOCK_TABLE` | Table name (`terraform_lock`) |
+### Step 5 – Configure GitHub repository
 
-### Step 5 – Drop in Alibaba Cloud LZ IaC
+Add all six variables from Steps 3–4 to **Settings → Variables**.
+Create environments `lz-plan`, `lz-deploy`, `lz-destroy` (see §5).
+Configure branch protection on `main` (see §5).
 
-Place the Alibaba Cloud–provided LZ IaC files into:
-```
-terraform/environments/landing-zone/
-```
+### Step 6 – Drop in IaC and configure variables
 
-See `terraform/environments/landing-zone/README.md` for the expected layout.
-
-### Step 6 – Configure and commit variable values
+Place the Alibaba Cloud LZ IaC files into `terraform/environments/landing-zone/`.
 
 ```bash
 cp terraform/environments/landing-zone/landing-zone.tfvars.example \
    terraform/environments/landing-zone/landing-zone.tfvars
-# Edit landing-zone.tfvars – fill in account IDs, CIDRs, names, etc.
+# Edit landing-zone.tfvars — fill in account IDs, CIDRs, names, etc.
 ```
 
-Commit to a feature branch and open a PR.  This triggers `lz-pr-validate` and
-posts a Terraform plan as a PR comment so you can review what will be created
-before Day-1 apply.
+### Step 7 – Open a PR and review
 
 ```bash
 git checkout -b feat/initial-lz-config
-git add terraform/environments/landing-zone/landing-zone.tfvars
+git add terraform/environments/landing-zone/
 git commit -m "chore: initial landing zone variable configuration"
 git push -u origin feat/initial-lz-config
-# Open PR → review the plan comment → merge to main
 ```
 
-### Step 7 – Trigger the first deploy
+This triggers `lz-pr-validate` — review the plan posted as a PR comment,
+then approve and merge to `main`.
 
-Merging to `main` in Step 6 triggers `lz-deploy.yml` automatically.
-Alternatively, trigger manually:
+### Step 8 – Approve deploy and verify
 
-```bash
-gh workflow run lz-deploy.yml --ref main
-```
-
-The workflow pauses at the **lz-deploy** environment gate.  An approver must
-go to **Actions → the run → Review deployments** and approve.  After approval
-the apply job runs and creates the landing zone.
-
-### Step 8 – Verify
+Merging triggers `lz-deploy`.  Approve the `lz-deploy` environment gate.
 
 ```bash
-# Check the apply log artifact in the completed workflow run
-gh run view --log <RUN_ID>
-
-# Confirm state was written
+# After deploy completes, verify state was written:
 aliyun oss ls oss://<STATE_BUCKET_NAME>/landing-zone/
 ```
 
-Confirm in the Alibaba Cloud console that the expected resources exist
-(Resource Directory folders, VPC, CEN, logging, etc.).
+Confirm expected resources exist in the Alibaba Cloud console.
 
 ### Step 9 – Revoke bootstrap credentials
 
-The static `AccessKey`/`SecretKey` used in Steps 2–4 are no longer needed.
-
 ```bash
-# Disable (preferred – reversible) or delete the bootstrap AK
 aliyun ram UpdateAccessKey \
   --UserName <bootstrap-user> \
   --UserAccessKeyId <AK_ID> \
   --Status Inactive
 ```
 
-All subsequent pipeline runs authenticate exclusively via OIDC → STS.
+All subsequent operations authenticate via OIDC → STS.
 
 ---
 
@@ -541,24 +412,18 @@ All subsequent pipeline runs authenticate exclusively via OIDC → STS.
 
 **State key**: `landing-zone/terraform.tfstate`
 
-Backend configuration is injected at runtime via `-backend-config` flags in the
-workflow – no sensitive values are hardcoded in `backend.tf`.
+Backend configuration is injected at runtime via `-backend-config` flags –
+no sensitive values are hardcoded in `backend.tf`.
 
 ### State recovery
 
-If the state lock is stuck (e.g., after a runner crash):
-
 ```bash
-# Force-unlock (use with caution – confirm no other operation is running)
-terraform force-unlock <LOCK_ID> \
-  -backend-config="bucket=<bucket>" \
-  -backend-config="region=<region>" \
-  -backend-config="tablestore_endpoint=<endpoint>" \
-  -backend-config="tablestore_table=<table>"
+# Force-unlock (confirm no other operation is running first)
+terraform force-unlock <LOCK_ID>
 ```
 
-Because OSS versioning is enabled on the state bucket, previous state versions
-can be recovered from the OSS console if needed.
+OSS versioning is enabled — previous state versions can be recovered from
+the OSS console.
 
 ---
 
@@ -566,54 +431,21 @@ can be recovered from the OSS console if needed.
 
 | Control | Implementation |
 |---------|---------------|
-| No static credentials | GitHub OIDC → STS temp credentials (1 h TTL) |
-| Least-privilege deployment role | RAM Role with scoped policy (tighten `AdministratorAccess` post-bootstrap) |
-| Deployment approval gate | GitHub Environment `lz-deploy` with required reviewers |
+| No static credentials | GitHub OIDC → STS temp credentials (1h TTL) |
+| Least-privilege role | RAM Role (tighten `AdministratorAccess` post-bootstrap) |
+| Deploy approval gate | GitHub Environment `lz-deploy` (≥1 reviewer) |
 | Branch protection | PRs + status checks required on `main` |
 | Plan-then-apply | Exact plan binary applied; no re-plan on apply |
-| Destroy double-gate | Confirmation string + GitHub Environment `lz-destroy` (≥2 reviewers) |
-| Drift detection | Daily terraform plan in check mode; auto-issue on drift |
-| Code scanning | Checkov on every PR (SARIF → GitHub Security tab) |
-| Artifact integrity | Source artifact is packaged and uploaded by the AKS runner; the GitHub-hosted runner downloads the same artifact |
+| Destroy triple-gate | Confirmation string + destroy plan + `lz-destroy` (≥2 reviewers) |
+| Drift detection | Daily terraform plan; auto-issue on drift |
+| Artifact integrity | Source packaged by AKS runner; downloaded by GitHub-hosted runner |
 | State encryption | OSS SSE-AES256 at rest |
-| State versioning | OSS bucket versioning enabled (state recovery) |
-| Audit trail | Workflow logs + apply log artifacts (30-day retention) |
-| Concurrent deploy prevention | `concurrency` group on deploy workflow |
+| State versioning | OSS bucket versioning (state recovery) |
+| Audit trail | Workflow logs + apply artifacts (30d retention, 90d for destroy) |
+| Concurrency prevention | `concurrency` group with `cancel-in-progress: false` |
 
-### Hardening the RAM Role (post-bootstrap)
-
-Replace the broad `AdministratorAccess` policy with a custom RAM policy scoped
-to only the services and actions the LZ IaC requires.  Typical LZ services:
-
-```
-ResourceDirectory:*
-RAM:*
-VPC:*
-CEN:*
-SLS:*          (Log Service)
-OSS:PutObject, GetObject, ...
-ActionTrail:*
-CloudMonitor:*
-OTS:*          (TableStore – state locking)
-```
-
-Create a custom policy and attach it to the role:
-```bash
-aliyun ram CreatePolicy \
-  --PolicyName "github-lz-deploy-policy" \
-  --PolicyDocument file://docs/iam-policy.json \
-  --Description "Scoped policy for GitHub Actions LZ deployment"
-
-aliyun ram DetachPolicyFromRole \
-  --PolicyType System \
-  --PolicyName AdministratorAccess \
-  --RoleName github-lz-deploy
-
-aliyun ram AttachPolicyToRole \
-  --PolicyType Custom \
-  --PolicyName github-lz-deploy-policy \
-  --RoleName github-lz-deploy
-```
+See [DESIGN.md §8](DESIGN.md#8-approval-gates-and-review-process) for a
+detailed explanation of the approval gates and review process.
 
 ---
 
@@ -621,22 +453,17 @@ aliyun ram AttachPolicyToRole \
 
 ### Deploying a change
 
-1. Create a feature branch from `main`.
-2. Modify `terraform/environments/landing-zone/` or `landing-zone.tfvars`.
-3. Open a PR → `lz-pr-validate` runs automatically.
-4. Review the Terraform plan posted as a PR comment.
-5. Address any Checkov findings in the Security tab.
-6. Get PR approved and merge to `main`.
-7. `lz-deploy` triggers automatically.  Approve the `lz-deploy` environment gate.
-8. Monitor the apply job output.
+1. Create a feature branch and modify IaC code.
+2. Open a PR → `lz-pr-validate` runs automatically.
+3. Review the plan posted as a PR comment.
+4. Merge to `main` → `lz-deploy` triggers.
+5. Approve the `lz-deploy` environment gate.
+6. Monitor the apply job.
 
 ### Emergency targeted deployment
 
 ```bash
-gh workflow run lz-deploy.yml \
-  --field environment=landing-zone \
-  --field target="module.network_foundation" \
-  --ref main
+gh workflow run lz-deploy.yml --field target="module.network_foundation" --ref main
 ```
 
 ### Checking for drift manually
@@ -647,15 +474,9 @@ gh workflow run lz-drift-detect.yml --ref main
 
 ### Recovering from a failed apply
 
-1. Check the apply log artifact in the failed workflow run.
-2. Fix the root cause in a feature branch.
-3. Open a PR and follow the normal deploy flow.
-4. If state is locked, run `terraform force-unlock` (see §8).
-
-### Rotating the deployment role
-
-1. Run `./scripts/setup-oidc.sh` again (it updates the trust policy non-destructively).
-2. If updating the role ARN, update the `ALICLOUD_OIDC_ROLE_ARN` GitHub variable.
+1. Check the apply log artifact in the failed run.
+2. Fix the root cause in a feature branch → PR → merge.
+3. If state is locked: `terraform force-unlock <LOCK_ID>` (see §8).
 
 ---
 
@@ -664,11 +485,11 @@ gh workflow run lz-drift-detect.yml --ref main
 | Term | Meaning |
 |------|---------|
 | LZ | Landing Zone – foundational Alibaba Cloud account/network structure |
-| OIDC | OpenID Connect – used here for keyless GitHub → Alibaba Cloud auth |
+| OIDC | OpenID Connect – keyless GitHub → Alibaba Cloud auth |
 | STS | Security Token Service – issues temp credentials from OIDC tokens |
-| RAM | Resource Access Management – Alibaba Cloud identity and access service |
+| RAM | Resource Access Management – Alibaba Cloud IAM |
 | OSS | Object Storage Service – Alibaba Cloud blob storage |
-| OTS / TableStore | Alibaba Cloud NoSQL service, used here for Terraform state locking |
+| OTS / TableStore | Alibaba Cloud NoSQL, used for Terraform state locking |
 | CEN | Cloud Enterprise Network – Alibaba Cloud transit routing |
 | SLS | Simple Log Service – centralised logging |
-| ActionTrail | Alibaba Cloud audit log service (equivalent of CloudTrail / Activity Log) |
+| AKS | Azure Kubernetes Service – hosts the corporate self-hosted runner |

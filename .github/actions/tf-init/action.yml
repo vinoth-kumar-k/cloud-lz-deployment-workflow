@@ -33,12 +33,12 @@ runs:
         terraform_version: "1.9.5"
         terraform_wrapper: false
 
-    - uses: aliyun/credentials@v1
+    - uses: aliyun/configure-aliyun-credentials-action@v1
       with:
         role-to-assume: ${{ vars.ALICLOUD_OIDC_ROLE_ARN }}
         oidc-provider-arn: ${{ vars.ALICLOUD_OIDC_PROVIDER_ARN }}
         role-session-name: ${{ inputs.session-name }}
-        role-duration-seconds: ${{ inputs.duration }}
+        role-session-expiration: ${{ inputs.duration }}
 
     - shell: bash
       working-directory: ${{ inputs.working-dir }}
