@@ -24,7 +24,7 @@ env:
 jobs:
   # ── Guard: validate confirmation string before anything else
   validate-confirmation:
-    runs-on: [self-hosted, cloud]
+    runs-on: ubuntu-22.04
     steps:
       - name: Check confirmation
         run: |
@@ -37,7 +37,7 @@ jobs:
   # ── Corporate runner: checkout and package source ──────────
   fetch-source:
     needs: validate-confirmation
-    runs-on: [self-hosted, corporate]
+    runs-on: [self-hosted, aks]
     outputs:
       artifact-name: ${{ steps.pkg.outputs.artifact-name }}
     steps:
@@ -59,7 +59,7 @@ jobs:
   # ── Cloud runner: destroy plan ─────────────────────────────
   plan-destroy:
     needs: fetch-source
-    runs-on: [self-hosted, cloud]
+    runs-on: ubuntu-22.04
     outputs:
       plan-artifact: ${{ steps.save.outputs.name }}
     steps:
@@ -89,7 +89,7 @@ jobs:
   # ── Human approval gate ─────────────────────────────────────
   await-approval:
     needs: plan-destroy
-    runs-on: [self-hosted, cloud]
+    runs-on: ubuntu-22.04
     environment: lz-destroy
     steps:
       - run: "echo Destruction approved. Reason: ${{ inputs.reason }}"
@@ -97,7 +97,7 @@ jobs:
   # ── Cloud runner: execute destroy ──────────────────────────
   execute-destroy:
     needs: [fetch-source, plan-destroy, await-approval]
-    runs-on: [self-hosted, cloud]
+    runs-on: ubuntu-22.04
     steps:
       - uses: ./.github/actions/tf-init
         with:

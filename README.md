@@ -1,10 +1,10 @@
 # Alibaba Cloud Landing Zone – Deployment Workflow
 
 GitHub Actions–based CI/CD pipeline for deploying and managing an Alibaba Cloud
-Landing Zone (LZ) from IaC code.  The design assumes a **highly restrictive
-corporate environment** with GitHub Enterprise Cloud, mixed self-hosted and
-GitHub-hosted runners, and **GitHub OIDC** as the authentication mechanism
-(no static cloud credentials stored anywhere).
+Landing Zone (LZ) from IaC code.  The design assumes a **corporate environment**
+with GitHub Enterprise Cloud, an AKS self-hosted runner for code checkout, and
+GitHub-hosted runners for Terraform operations.  Authentication uses
+**GitHub OIDC** (no static cloud credentials stored anywhere).
 
 ---
 
@@ -31,61 +31,35 @@ GitHub-hosted runners, and **GitHub OIDC** as the authentication mechanism
 │                                                                          │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
 │  │  Repository: cloud-lz-deployment-workflow                        │    │
-│  │                                                                   │    │
 │  │  Branches: main (protected) ← feature/* ← PRs                   │    │
-│  │                                                                   │    │
-│  │  Environments:                                                    │    │
-│  │    lz-plan    (no gate)                                          │    │
-│  │    lz-deploy  (required reviewers + branch protection)           │    │
-│  │    lz-destroy (required reviewers + branch protection)           │    │
+│  │  Environments: lz-plan / lz-deploy / lz-destroy                  │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
 │                                                                          │
-│  Workflows (GitHub Actions):                                             │
-│    lz-pr-validate.yml   ← runs on every PR                             │
-│    lz-deploy.yml        ← runs on merge to main / manual dispatch      │
-│    lz-drift-detect.yml  ← scheduled daily                              │
-│    lz-destroy.yml       ← manual dispatch only, double-gated           │
+│  Workflows: lz-pr-validate / lz-deploy / lz-drift-detect / lz-destroy  │
 └──────────────┬───────────────────────────────────────────┬─────────────┘
                │                                           │
-               │ Job dispatched to runner                  │ OIDC token exchange
+               │ fetch-source job                          │ Cloud jobs
                ▼                                           ▼
 ┌──────────────────────────┐              ┌──────────────────────────────┐
-│  Self-hosted Runner      │              │  Alibaba Cloud STS           │
-│  Label: corporate        │              │  sts.aliyuncs.com            │
+│  AKS Runner              │              │  GitHub-hosted Runner        │
+│  Labels: self-hosted, aks│              │  (ubuntu-22.04)              │
 │                          │              │                              │
-│  ● Inside corporate      │              │  ● Validates GitHub OIDC     │
-│    network               │              │    token against RAM OIDC    │
-│  ● Can access internal   │              │    Provider                  │
-│    code / registries     │              │  ● Returns temporary STS     │
-│  ● Job: checkout code    │              │    credentials (1 h TTL)     │
-│    + package artifact    │              └──────────────────────────────┘
-└──────────┬───────────────┘                            ▲
-           │ Upload artifact                            │ Role ARN
-           ▼                                            │
-┌──────────────────────────┐              ┌─────────────┴────────────────┐
-│  GitHub Artifact Store   │              │  Self-hosted Runner          │
-│  (encrypted at rest)     │              │  Label: cloud                │
-└──────────┬───────────────┘              │                              │
-           │ Download artifact            │  ● Internet-accessible       │
-           ▼                              │    (or proxied to Alibaba    │
-┌──────────────────────────┐              │    Cloud APIs)               │
-│  Self-hosted Runner      │              │  ● Jobs: tf init/plan/apply  │
-│  Label: cloud            ◄─────────────┘  ● Acquires OIDC creds       │
-│                          │              │    before each cloud op       │
-│  Terraform operations    │              └──────────────────────────────┘
-│  with STS temp creds     │                            │
-└──────────────────────────┘                            │ Terraform API calls
-                                                        ▼
-                                         ┌──────────────────────────────┐
-                                         │  Alibaba Cloud               │
-                                         │                              │
-                                         │  ResourceDirectory           │
-                                         │  RAM (Identity)              │
-                                         │  VPC / CEN                   │
-                                         │  Security Baseline           │
-                                         │  Logging (SLS / OSS)         │
-                                         │  OSS (TF state + lock)       │
-                                         └──────────────────────────────┘
+│  ● Inside corporate      │              │  ● Full internet access      │
+│    network (Azure K8s)   │              │  ● Pre-installed tools       │
+│  ● Checkout code from    │              │  ● OIDC → STS auth           │
+│    internal repos        │              │  ● Terraform init/plan/apply │
+│  ● Package + upload      │              └──────────────┬───────────────┘
+│    artifact              │                             │
+└──────────┬───────────────┘                             │ OIDC token
+           │ Upload artifact                             │ exchange
+           ▼                                             ▼
+┌──────────────────────────┐              ┌──────────────────────────────┐
+│  GitHub Artifact Store   │              │  Alibaba Cloud               │
+│  (encrypted at rest)     │──download──▶ │                              │
+└──────────────────────────┘              │  STS → temp credentials      │
+                                          │  ResourceDirectory / RAM     │
+                                          │  VPC / CEN / SLS / OSS      │
+                                          └──────────────────────────────┘
 ```
 
 ---
@@ -94,161 +68,33 @@ GitHub-hosted runners, and **GitHub OIDC** as the authentication mechanism
 
 ### Labels and responsibilities
 
-| Label | Network zone | Responsibilities |
-|-------|-------------|-----------------|
-| `self-hosted, corporate` | Inside corporate network | Checkout from internal repos; package IaC source into artifact |
-| `self-hosted, cloud` | Corporate network + outbound internet to Alibaba Cloud APIs | Terraform init / plan / apply; OIDC token exchange with STS |
+| Runner | `runs-on` | Responsibilities |
+|--------|-----------|-----------------|
+| Corporate (AKS) | `[self-hosted, aks]` | Checkout from internal repos; package IaC source into artifact |
+| Cloud (GitHub-hosted) | `ubuntu-22.04` | Terraform init / plan / apply; OIDC token exchange with STS |
 
 ### Why two runner types?
 
 Corporate policy prevents GitHub-hosted runners from reaching internal code
-repositories and private package registries.  The **corporate** runner handles
-the checkout; it never touches Alibaba Cloud.  The **cloud** runner receives
-only the pre-packaged artifact (never raw source) and authenticates to Alibaba
-Cloud via short-lived OIDC tokens – it stores no long-lived credentials.
+repositories and private package registries.  The **AKS runner** handles
+the checkout; it never touches Alibaba Cloud.  The **GitHub-hosted runner**
+receives only the pre-packaged artifact (never raw source) and authenticates
+to Alibaba Cloud via short-lived OIDC tokens – it stores no long-lived
+credentials.
 
-### Pre-LZ vs post-LZ runner topology
+Because the cloud runner is GitHub-hosted, there is no VM provisioning,
+software installation, or network configuration required.  The runner
+comes pre-installed with standard tools, and additional tools (Terraform,
+Alibaba Cloud CLI) are installed via workflow steps (`hashicorp/setup-terraform`).
 
-This is the key Day-1 consideration.
-
-```
-PRE-LZ (Day-1 bootstrap)                 POST-LZ (steady state, optional)
-────────────────────────                 ───────────────────────────────
-Corporate network                        Corporate network
-  ┌────────────────┐                       ┌────────────────┐
-  │ corporate      │                       │ corporate      │
-  │ runner         │                       │ runner         │ (unchanged)
-  │ (existing VM)  │                       │ (existing VM)  │
-  └────────────────┘                       └────────────────┘
-
-  ┌────────────────┐                     Alibaba Cloud (LZ deployed)
-  │ cloud runner   │   ──── migrate ───▶   ┌──────────────────────┐
-  │ (new VM on     │                       │ cloud runner         │
-  │  corporate     │                       │ (ECS instance inside │
-  │  network with  │                       │  the LZ, egress to   │
-  │  internet/     │                       │  GitHub + STS)       │
-  │  proxy access) │                       └──────────────────────┘
-  └────────────────┘
-```
-
-**For Day-1, both runners live on corporate infrastructure.**  The cloud runner
-is simply a corporate VM that has outbound internet access (direct or via
-proxy) to the Alibaba Cloud API endpoints.  There is no chicken-and-egg
-problem – the pipeline does not depend on Alibaba Cloud compute to deploy
-Alibaba Cloud.
-
-Once the LZ is live and an ECS instance is available inside it, the cloud
-runner can optionally be migrated there.  This is purely operational preference
-and does not change any workflow or action code.
-
-### Minimum VM specification
-
-| Runner | CPU | RAM | Disk | OS |
-|--------|-----|-----|------|----|
-| corporate | 2 vCPU | 4 GB | 20 GB | Ubuntu 22.04 LTS |
-| cloud | 2 vCPU | 4 GB | 30 GB | Ubuntu 22.04 LTS |
-
-The cloud runner needs more disk because Terraform downloads provider plugins
-(~500 MB per init for the alicloud provider).
-
-### Network requirements for the cloud runner
-
-Outbound HTTPS (443) to:
-
-| Destination | Purpose |
-|-------------|---------|
-| `token.actions.githubusercontent.com` | GitHub OIDC token endpoint |
-| `api.github.com` | GitHub API (artifact upload/download) |
-| `objects.githubusercontent.com` | GitHub artifact storage |
-| `sts.aliyuncs.com` | STS OIDC token exchange |
-| `ram.aliyuncs.com` | RAM API calls |
-| `oss-cn-<region>.aliyuncs.com` | OSS state backend |
-| `<instance>.cn-<region>.ots.aliyuncs.com` | TableStore state locking |
-| `*.aliyuncs.com` | Alibaba Cloud service APIs (Terraform provider) |
-| `registry.terraform.io` | Terraform provider downloads (or internal mirror) |
-
-If outbound internet is restricted to a proxy, set `HTTP_PROXY`/`HTTPS_PROXY`
-on the runner service and add `NO_PROXY=169.254.169.254` (instance metadata).
-
-### Runner software installation
-
-Run these steps on both VMs (adjust if using a different Linux distro):
-
-```bash
-# 1. Install runtime dependencies
-sudo apt-get update && sudo apt-get install -y curl jq git tar unzip
-
-# 2. Install Terraform
-TERRAFORM_VERSION="1.9.5"
-curl -fsSL "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip" \
-  -o /tmp/terraform.zip
-sudo unzip /tmp/terraform.zip -d /usr/local/bin/
-sudo chmod +x /usr/local/bin/terraform
-terraform version
-
-# 3. Install Alibaba Cloud CLI (cloud runner only)
-curl -fsSL https://aliyuncli.alicdn.com/aliyun-cli-linux-latest-amd64.tgz \
-  -o /tmp/aliyun-cli.tgz
-sudo tar -xzf /tmp/aliyun-cli.tgz -C /usr/local/bin/
-aliyun version
-
-# 4. Create a dedicated service account for the runner process
-sudo useradd -m -s /bin/bash github-runner
-```
-
-### GitHub Actions runner agent registration
-
-GitHub Enterprise Cloud generates a one-time registration token per runner.
-Repeat for each VM.
-
-```bash
-# On the runner VM, as the github-runner user:
-sudo su - github-runner
-
-# Download the latest runner agent (check https://github.com/actions/runner/releases)
-RUNNER_VERSION="2.317.0"
-mkdir ~/actions-runner && cd ~/actions-runner
-curl -fsSL "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz" \
-  -o runner.tar.gz
-tar -xzf runner.tar.gz
-
-# Configure – obtain the token from:
-# GHEC org → Settings → Actions → Runners → New self-hosted runner
-./config.sh \
-  --url https://github.com/<YOUR_ORG> \
-  --token <REGISTRATION_TOKEN> \
-  --name lz-corporate-runner-01 \     # or lz-cloud-runner-01
-  --labels self-hosted,corporate \    # or self-hosted,cloud
-  --runnergroup lz-runners \
-  --work _work \
-  --unattended
-
-# Install and start as a systemd service
-sudo ./svc.sh install github-runner
-sudo ./svc.sh start
-sudo ./svc.sh status
-```
-
-### Runner group configuration in GitHub Enterprise Cloud
-
-Runner groups restrict which repositories can use which runners.
-
-1. Go to **Org → Settings → Actions → Runner groups → New runner group**
-2. Create group: `lz-runners`
-3. Access policy: **Selected repositories** → add `cloud-lz-deployment-workflow`
-4. Move both runners into this group
-5. Disable **Allow public repositories** (enterprise policy)
-
-This ensures the LZ deployment runners are not available to other repos in the
-organisation.
-
-### Tool checklist – verify before first pipeline run
+### Tool checklist – verify CI readiness
 
 ```bash
 ./scripts/validate-prereqs.sh
 ```
 
-All checks must pass on the cloud runner before triggering Day-1 deployment.
+This script validates that required tools and environment variables are
+available in the CI context.
 
 ---
 
@@ -443,16 +289,16 @@ Runs on every PR targeting `main` that modifies `terraform/**`.
 PR opened / updated
        │
        ▼
-[corporate runner] fetch-source
+[AKS runner] fetch-source
        │  Upload artifact
        ▼
-[cloud runner] static-analysis
+[GitHub-hosted runner] static-analysis
        │  terraform fmt -check
        │  terraform validate
        │  checkov security scan (SARIF → Security tab)
        │
        ▼
-[cloud runner] plan  (environment: lz-plan)
+[GitHub-hosted runner] plan  (environment: lz-plan)
        │  OIDC → STS credentials
        │  terraform init (OSS backend)
        │  terraform plan -out tfplan
@@ -475,20 +321,20 @@ Triggers on:
 Push to main / manual trigger
        │
        ▼
-[corporate runner] fetch-source
+[AKS runner] fetch-source
        │
        ▼
-[cloud runner] plan  (environment: lz-plan)
+[GitHub-hosted runner] plan  (environment: lz-plan)
        │  OIDC → STS
        │  terraform plan -out tfplan
        │  Detect if changes exist
        │
        ▼ (if changes detected)
-[cloud runner] await-approval  (environment: lz-deploy)
+[GitHub-hosted runner] await-approval  (environment: lz-deploy)
        │  ← Human approval required here
        │
        ▼
-[cloud runner] apply
+[GitHub-hosted runner] apply
        │  Fresh OIDC → STS (previous session may have expired)
        │  terraform apply tfplan   (applies the exact saved plan)
        │  Upload apply log (retained 30 days)
@@ -531,47 +377,39 @@ Use only for full environment decommission or DR exercises.
 
 ## 7. Day-1 Setup Procedure
 
-Follow these steps **in order**.  Steps 1–4 run on an operator workstation or
-on the cloud runner VM itself (whichever has `aliyun` CLI configured).
-Steps 5 onward require the runners to be registered and healthy first.
+Follow these steps **in order**.  Steps 1–3 run on an operator workstation
+(whichever has `aliyun` CLI configured).  Steps 4 onward require the AKS
+runner to be registered and healthy.
 
 ```
-Workstation / cloud runner VM          GitHub                  Alibaba Cloud
-──────────────────────────────         ──────                  ─────────────
-Step 1: aliyun configure
-Step 2: setup-oidc.sh          ──────────────────────────▶  Creates OIDC Provider + Role
-Step 3: bootstrap-state.sh     ──────────────────────────▶  Creates OSS bucket + TableStore
-Step 4: runner registration    ──────────────────────────▶  Runner appears in GHEC
+Workstation                            GitHub                  Alibaba Cloud
+───────────                            ──────                  ─────────────
+Step 1: Verify AKS runner                                     (already registered)
+Step 2: aliyun configure
+Step 3: setup-oidc.sh          ──────────────────────────▶  Creates OIDC Provider + Role
+Step 4: bootstrap-state.sh     ──────────────────────────▶  Creates OSS bucket + TableStore
 Step 5: drop in LZ IaC
 Step 6: configure tfvars + commit
-Step 7: gh workflow run        ──────────────────────────▶  Pipeline runs on runner
+Step 7: gh workflow run        ──────────────────────────▶  Pipeline runs
                                                               ▼ OIDC auth
                                                               ▼ terraform apply
 Step 8: revoke bootstrap creds ──────────────────────────▶  Disable static AK/SK
 ```
 
-### Step 1 – Provision and register self-hosted runners
+### Step 1 – Verify the AKS runner is registered
 
-Before anything else, both VMs must be running and registered.
-Follow §2 (Runner Architecture) for:
-- VM provisioning and software installation
-- Runner agent download and `./config.sh` registration
-- Runner group setup in GHEC
+Ensure the AKS self-hosted runner is registered in GitHub Enterprise with
+labels `self-hosted, aks`.  Refer to your organisation's AKS runner
+documentation for provisioning details.
 
-Verify both runners appear as **Idle** in:
+Verify the runner appears as **Idle** in:
 **Org → Settings → Actions → Runners**
 
-Then confirm the cloud runner is ready:
-```bash
-# On the cloud runner VM:
-./scripts/validate-prereqs.sh
-```
-
-All checks must pass before continuing.
+Cloud jobs use GitHub-hosted runners (`ubuntu-22.04`) and require no setup.
 
 ### Step 2 – Configure Alibaba Cloud CLI (bootstrap credentials only)
 
-On your workstation or the cloud runner VM:
+On your workstation:
 
 ```bash
 aliyun configure
@@ -736,7 +574,7 @@ can be recovered from the OSS console if needed.
 | Destroy double-gate | Confirmation string + GitHub Environment `lz-destroy` (≥2 reviewers) |
 | Drift detection | Daily terraform plan in check mode; auto-issue on drift |
 | Code scanning | Checkov on every PR (SARIF → GitHub Security tab) |
-| Artifact integrity | Source artifact is packaged and uploaded by the corporate runner; the cloud runner downloads the same artifact |
+| Artifact integrity | Source artifact is packaged and uploaded by the AKS runner; the GitHub-hosted runner downloads the same artifact |
 | State encryption | OSS SSE-AES256 at rest |
 | State versioning | OSS bucket versioning enabled (state recovery) |
 | Audit trail | Workflow logs + apply log artifacts (30-day retention) |

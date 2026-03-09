@@ -16,7 +16,7 @@ env:
 jobs:
   # ── Corporate runner: checkout and package source ──────────
   fetch-source:
-    runs-on: [self-hosted, corporate]
+    runs-on: [self-hosted, aks]
     outputs:
       artifact-name: ${{ steps.pkg.outputs.artifact-name }}
     steps:
@@ -38,7 +38,7 @@ jobs:
   # ── Cloud runner: plan in check mode ───────────────────────
   drift-check:
     needs: fetch-source
-    runs-on: [self-hosted, cloud]
+    runs-on: ubuntu-22.04
     outputs:
       drift-detected: ${{ steps.plan.outputs.drift-detected }}
       drift-summary: ${{ steps.plan.outputs.drift-summary }}
@@ -83,7 +83,7 @@ jobs:
   alert:
     needs: drift-check
     if: needs.drift-check.outputs.drift-detected == 'true'
-    runs-on: [self-hosted, cloud]
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/github-script@v7
         with:

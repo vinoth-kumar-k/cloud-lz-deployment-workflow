@@ -23,7 +23,7 @@ env:
 jobs:
   # ── Corporate runner: checkout and package source ──────────
   fetch-source:
-    runs-on: [self-hosted, corporate]
+    runs-on: [self-hosted, aks]
     outputs:
       artifact-name: ${{ steps.pkg.outputs.artifact-name }}
     steps:
@@ -48,7 +48,7 @@ jobs:
   # ── Cloud runner: static analysis (no cloud creds needed) ──
   static-analysis:
     needs: fetch-source
-    runs-on: [self-hosted, cloud]
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -93,7 +93,7 @@ jobs:
   # ── Cloud runner: plan against real state (OIDC auth) ──────
   plan:
     needs: [fetch-source, static-analysis]
-    runs-on: [self-hosted, cloud]
+    runs-on: ubuntu-22.04
     environment: lz-plan
     steps:
       - uses: ./.github/actions/tf-init

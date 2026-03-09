@@ -27,7 +27,7 @@ env:
 jobs:
   # ── Corporate runner: checkout and package source ──────────
   fetch-source:
-    runs-on: [self-hosted, corporate]
+    runs-on: [self-hosted, aks]
     outputs:
       artifact-name: ${{ steps.pkg.outputs.artifact-name }}
     steps:
@@ -50,7 +50,7 @@ jobs:
   # ── Cloud runner: plan ─────────────────────────────────────
   plan:
     needs: fetch-source
-    runs-on: [self-hosted, cloud]
+    runs-on: ubuntu-22.04
     environment: lz-plan
     outputs:
       plan-artifact: ${{ steps.save.outputs.name }}
@@ -101,7 +101,7 @@ jobs:
   await-approval:
     needs: plan
     if: needs.plan.outputs.has-changes == 'true'
-    runs-on: [self-hosted, cloud]
+    runs-on: ubuntu-22.04
     environment: lz-deploy
     steps:
       - run: "echo Approved – run ${{ github.run_id }}"
@@ -110,7 +110,7 @@ jobs:
   apply:
     needs: [fetch-source, plan, await-approval]
     if: needs.plan.outputs.has-changes == 'true'
-    runs-on: [self-hosted, cloud]
+    runs-on: ubuntu-22.04
     steps:
       - uses: ./.github/actions/tf-init
         with:

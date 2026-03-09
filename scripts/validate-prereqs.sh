@@ -3,9 +3,8 @@
 # validate-prereqs.sh
 #
 # Checks that all required tools and configuration are present
-# on the machine before running any deployment.
-# Run this on both corporate and cloud self-hosted runners
-# during initial runner setup to confirm readiness.
+# in the CI environment before running any deployment.
+# Runs in GitHub Actions workflows to validate runner readiness.
 #
 # Usage:
 #   ./scripts/validate-prereqs.sh
@@ -88,41 +87,7 @@ else
   warn "Not running inside a GitHub Actions runner environment"
 fi
 
-# ── 3. Network Connectivity ──────────────────────────────────
-header "Network Connectivity"
-
-check_endpoint() {
-  local label=$1 url=$2
-  if curl -sfo /dev/null --connect-timeout 10 "$url"; then
-    pass "$label reachable ($url)"
-  else
-    fail "$label unreachable ($url)"
-  fi
-}
-
-# Alibaba Cloud STS (required for OIDC credential exchange)
-check_endpoint "Alibaba Cloud STS"         "https://sts.aliyuncs.com"
-# Alibaba Cloud RAM
-check_endpoint "Alibaba Cloud RAM API"     "https://ram.aliyuncs.com"
-# OSS (state backend) – bucket URL checked separately after config
-check_endpoint "Alibaba Cloud OSS (global)" "https://oss-cn-hangzhou.aliyuncs.com"
-# GitHub (for OIDC token endpoint and Actions API)
-check_endpoint "GitHub API"                "https://api.github.com"
-# GitHub OIDC token endpoint
-check_endpoint "GitHub OIDC endpoint"      "https://token.actions.githubusercontent.com"
-
-# ── 4. Alibaba Cloud CLI configuration ───────────────────────
-header "Alibaba Cloud CLI Configuration"
-
-if command -v aliyun &>/dev/null; then
-  if aliyun configure list 2>/dev/null | grep -q "current"; then
-    pass "Alibaba Cloud CLI has an active profile"
-  else
-    warn "No active Alibaba Cloud CLI profile found. This is OK for OIDC-based workflows."
-  fi
-fi
-
-# ── 5. Environment Variables ─────────────────────────────────
+# ── 3. Environment Variables ─────────────────────────────────
 header "Required Environment Variables (CI context)"
 
 REQUIRED_VARS=(
@@ -150,7 +115,7 @@ for var in "${OIDC_VARS[@]}"; do
   fi
 done
 
-# ── 6. GitHub Actions OIDC (when inside a workflow) ──────────
+# ── 4. GitHub Actions OIDC (when inside a workflow) ──────────
 header "GitHub Actions OIDC Token"
 
 if [[ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" && -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]]; then
@@ -170,19 +135,6 @@ if [[ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" && -n "${ACTIONS_ID_TOKEN_REQUEST_T
   fi
 else
   warn "Not running in a GitHub Actions OIDC-enabled context (id-token: write permission required)"
-fi
-
-# ── 7. Proxy Configuration ───────────────────────────────────
-header "Proxy Configuration"
-
-for var in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
-  if [[ -n "${!var:-}" ]]; then
-    warn "$var is set: ${!var}"
-  fi
-done
-
-if [[ -z "${HTTP_PROXY:-}${HTTPS_PROXY:-}${http_proxy:-}${https_proxy:-}" ]]; then
-  pass "No HTTP proxy configured (direct internet access expected)"
 fi
 
 # ── Summary ──────────────────────────────────────────────────

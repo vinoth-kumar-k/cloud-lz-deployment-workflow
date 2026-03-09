@@ -10,32 +10,32 @@ The system uses a split runner architecture operating inside a corporate network
 ┌─────────────────────────┐         ┌─────────────────────────┐
 │ GitHub Enterprise Cloud │         │      Alibaba Cloud      │
 │                         │         │                         │
-│   ┌─────────────────┐   │         │    ┌───────────────┐    │
-│   │ GitHub Actions  │   │ OIDC    │    │ RAM OIDC Role │    │
-│   │                 │───┼─────────┼───▶│               │    │
+│   ┌─────────────────┐   │ OIDC    │    ┌───────────────┐    │
+│   │ GitHub Actions  │───┼─────────┼───▶│ RAM OIDC Role │    │
 │   └─────────────────┘   │ Auth    │    └───────────────┘    │
-│           │             │         │            │            │
-└───────────┼─────────────┘         └────────────┼────────────┘
-            │                                    │ STS Tokens
-            ▼                                    ▼
-┌─────────────────────────────────────────────────────────────┐
-│                     Corporate Network                       │
-│                                                             │
-│  ┌───────────────────┐               ┌───────────────────┐  │
-│  │ Corporate Runner  │               │   Cloud Runner    │  │
-│  │ (self-hosted)     │ Artifacts     │ (self-hosted)     │  │
-│  │ - Fetches source  │──────────────▶│ - Runs Terraform  │  │
-│  │ - Packages code   │               │ - Connects to API │  │
-│  └───────────────────┘               └───────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
+│      │            │     │         │            │            │
+└──────┼────────────┼─────┘         └────────────┼────────────┘
+       │            │                            │ STS Tokens
+       ▼            ▼                            ▼
+┌──────────────┐  ┌──────────────────────────────────────────┐
+│ AKS Runner   │  │ GitHub-hosted Runner (ubuntu-22.04)      │
+│ (self-hosted,│  │                                          │
+│  aks)        │  │ - Runs Terraform (init/plan/apply)       │
+│              │  │ - OIDC token exchange with STS           │
+│ - Checkout   │  │ - Pre-installed tools (no VM management) │
+│ - Package    │  └──────────────────────────────────────────┘
+│   artifact   │              │
+└──────┬───────┘              │ Terraform API calls
+       │ Upload artifact      ▼
+       └──────▶ GitHub Artifact Store
 ```
 
 ## 2. Runner Architecture
 
-The deployment leverages two types of self-hosted runners due to corporate constraints (unable to use GitHub-hosted runners for internal resources):
+The deployment uses two runner types:
 
-*   **Corporate Runner:** Located deep inside the corporate network. Responsibilities: Code checkout from internal GitHub Enterprise, packaging the IaC files, and uploading them as GitHub artifacts. It never connects to Alibaba Cloud.
-*   **Cloud Runner:** Located in the corporate network but has outbound internet access (or proxy access) to Alibaba Cloud API endpoints and GitHub APIs. Responsibilities: Downloads the artifact, performs Terraform operations (init, plan, apply), and exchanges OIDC tokens with Alibaba Cloud STS.
+*   **Corporate Runner (AKS):** A self-hosted runner on Azure Kubernetes Service (labels: `self-hosted, aks`), inside the corporate network. Responsibilities: Code checkout from internal GitHub Enterprise, packaging the IaC files, and uploading them as GitHub artifacts. It never connects to Alibaba Cloud.
+*   **Cloud Runner (GitHub-hosted):** A GitHub-hosted runner (`ubuntu-22.04`) with full internet access. Responsibilities: Downloads the artifact, performs Terraform operations (init, plan, apply), and exchanges OIDC tokens with Alibaba Cloud STS. No VM provisioning or management is required.
 
 ## 3. Authentication (GitHub OIDC)
 
@@ -77,7 +77,7 @@ The CI/CD pipeline consists of several key workflows:
 
 Before the pipeline can run, manual bootstrap steps are required:
 
-1.  **Runner Setup:** Provision and register both corporate and cloud runner VMs in GitHub Enterprise under a specific runner group (`lz-runners`).
+1.  **Runner Setup:** Ensure the AKS self-hosted runner is registered in GitHub Enterprise (labels: `self-hosted, aks`). Cloud jobs use GitHub-hosted runners (`ubuntu-22.04`) and require no provisioning.
 2.  **OIDC Bootstrap (`scripts/setup-oidc.sh`):** Using temporary manual CLI credentials, create the RAM OIDC Provider and Deployment RAM Role in Alibaba Cloud.
 3.  **State Backend Bootstrap (`scripts/bootstrap-state-backend.sh`):** Create the OSS bucket and TableStore instance/table.
 4.  **Configure GitHub Variables:** Add the generated ARN and Backend details to GitHub repository variables.
